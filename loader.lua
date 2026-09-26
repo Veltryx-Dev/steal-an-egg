@@ -7,234 +7,21 @@ local j=game:GetService( "ReplicatedStorage" )
 local k=game:GetService( "ProximityPromptService" )
 local a=game:GetService( "HttpService" )
 local TeleportService=game:GetService( "TeleportService" )
-
--- Lunaris Discord uptime monitor (stats-only; no player/account data is sent)
-local LUNARIS_WEBHOOK_CONFIG_FILE = "Lunaris_Webhook.json"
-local LUNARIS_WEBHOOK_URL = ""
-local LUNARIS_WEBHOOK_ENABLED = true
-local LUNARIS_WEBHOOK_INTERVAL = 600 -- 10 minutes
-local LUNARIS_WEBHOOK_SENT = 0
-local LUNARIS_WEBHOOK_LAST_STATUS = "Not configured"
-local LUNARIS_WEBHOOK_LAST_SENT_AT = 0
-local LUNARIS_WEBHOOK_NEXT_AT = 0
-local LunarisWebhookBusy = false
-
-local LunarisStats = { Divine = 0, Eternal = 0, Secret = 0 }
-local LunarisStartTime = os.clock()
-
--- Never call an optional executor function unless it is actually callable.
-local function LunarisSafeFunction(fn, ...)
-    if typeof(fn) ~= "function" then
-        return false, "function unavailable"
-    end
-    return pcall(fn, ...)
-end
-
-local function LunarisTrim(v, ...)
-    return tostring(v or ""):gsub("^%s+", ""):gsub("%s+$", "")
-end
-
-local function LunarisFormatUptime(seconds, ...)
-    seconds = math.max(0, math.floor(tonumber(seconds) or 0))
-    local days = math.floor(seconds / 86400)
-    seconds = seconds % 86400
-    local hours = math.floor(seconds / 3600)
-    seconds = seconds % 3600
-    local minutes = math.floor(seconds / 60)
-    seconds = seconds % 60
-    if days > 0 then
-        return string.format("%dd %02d:%02d:%02d", days, hours, minutes, seconds)
-    end
-    return string.format("%02d:%02d:%02d", hours, minutes, seconds)
-end
-
-local function LunarisWebhookConfigured(...)
-    local url = LunarisTrim(LUNARIS_WEBHOOK_URL)
-    return url ~= "" and string.find(url, "/api/webhooks/", 1, true) ~= nil
-end
-
-local function LunarisSaveWebhookConfig(...)
-    pcall(function(...)
-        if not writefile then
-            return
-        end
-        local data = {
-            webhook = LunarisTrim(LUNARIS_WEBHOOK_URL),
-            enabled = LUNARIS_WEBHOOK_ENABLED == true,
-            interval = math.floor(tonumber(LUNARIS_WEBHOOK_INTERVAL) or 600),
-        }
-        local ok, encoded = pcall(function()
-            return a:JSONEncode(data)
-        end)
-        if ok and type(encoded) == "string" then
-            writefile(LUNARIS_WEBHOOK_CONFIG_FILE, encoded)
-        end
-    end)
-end
-
-pcall(function(...)
-    if isfile and readfile and isfile(LUNARIS_WEBHOOK_CONFIG_FILE) then
-        local raw = readfile(LUNARIS_WEBHOOK_CONFIG_FILE)
-        local data = raw and a:JSONDecode(raw) or nil
-        if type(data) == "table" then
-            LUNARIS_WEBHOOK_URL = LunarisTrim(data.webhook)
-            if data.enabled ~= nil then
-                LUNARIS_WEBHOOK_ENABLED = data.enabled == true
-            end
-            local interval = tonumber(data.interval)
-            if interval then
-                LUNARIS_WEBHOOK_INTERVAL = math.clamp(math.floor(interval), 60, 3600)
-            end
-        end
-    end
-end)
-
-local function LunarisClassifyRarity(egg, ...)
-    if type(egg) ~= "table" then
-        return nil
-    end
-    local rarity = string.lower(tostring(egg.Rarity or ""))
-    if string.find(rarity, "divine", 1, true) then
-        return "Divine"
-    elseif string.find(rarity, "eternal", 1, true) then
-        return "Eternal"
-    elseif string.find(rarity, "secret", 1, true) then
-        return "Secret"
-    end
-    local tier = tonumber(egg.RarityTier)
-    if tier == 6 then
-        return "Divine"
-    elseif tier == 5 then
-        return "Eternal"
-    elseif tier == 4 then
-        return "Secret"
-    end
-    return nil
-end
-
-local function LunarisRecordStolenEgg(egg, ...)
-    local rarity = LunarisClassifyRarity(egg)
-    if rarity then
-        LunarisStats[rarity] = (LunarisStats[rarity] or 0) + 1
-    end
-end
-
-local function LunarisGetRequestFunction(...)
-    local candidates = {
-        (typeof(request) == "function" and request) or nil,
-        (typeof(http_request) == "function" and http_request) or nil,
-        (syn and typeof(syn.request) == "function" and syn.request) or nil,
-    }
-    for _, fn in ipairs(candidates) do
-        if typeof(fn) == "function" then
-            return fn
-        end
-    end
-    return nil
-end
-
-local function LunarisSendUptimeWebhook(...)
-    if LunarisWebhookBusy then
-        return false, "Webhook request already running"
-    end
-    if not LUNARIS_WEBHOOK_ENABLED then
-        LUNARIS_WEBHOOK_LAST_STATUS = "Disabled"
-        return false, "Webhook disabled"
-    end
-    local url = LunarisTrim(LUNARIS_WEBHOOK_URL)
-    if not LunarisWebhookConfigured() then
-        LUNARIS_WEBHOOK_LAST_STATUS = "Webhook not configured"
-        return false, "Webhook URL not configured"
-    end
-
-    local requestFn = LunarisGetRequestFunction()
-    if typeof(requestFn) ~= "function" then
-        LUNARIS_WEBHOOK_LAST_STATUS = "HTTP request unsupported"
-        return false, "No supported HTTP request function"
-    end
-
-    local uptime = os.clock() - LunarisStartTime
-    local payload = {
-        username = "Lunaris",
-        embeds = {{
-            title = "🌙 Lunaris — Uptime Check",
-            color = 10181046,
-            fields = {
-                { name = "👑 Divine Egg Stolen", value = tostring(LunarisStats.Divine or 0), inline = true },
-                { name = "⚡ Ethernal Egg Stolen", value = tostring(LunarisStats.Eternal or 0), inline = true },
-                { name = "🔥 Secret Egg Stolen", value = tostring(LunarisStats.Secret or 0), inline = true },
-                { name = "⏱️ Total Uptime", value = LunarisFormatUptime(uptime), inline = true },
-                { name = "🔁 Interval", value = string.format("%dm", math.floor(LUNARIS_WEBHOOK_INTERVAL / 60)), inline = true },
-                { name = "📨 Reports Sent", value = tostring(LUNARIS_WEBHOOK_SENT or 0), inline = true },
-            },
-            footer = { text = "Lunaris Uptime Monitor" },
-        }},
-    }
-
-    local okEncode, body = pcall(a.JSONEncode, a, payload)
-    if not okEncode then
-        LUNARIS_WEBHOOK_LAST_STATUS = "Payload encode failed"
-        return false, body
-    end
-
-    LunarisWebhookBusy = true
-    local ok, response = LunarisSafeFunction(requestFn, {
-        Url = url,
-        Method = "POST",
-        Headers = { ["Content-Type"] = "application/json" },
-        Body = body,
-    })
-    LunarisWebhookBusy = false
-
-    if ok then
-        local statusCode = type(response) == "table" and tonumber(response.StatusCode) or nil
-        if not statusCode or (statusCode >= 200 and statusCode < 300) then
-            LUNARIS_WEBHOOK_SENT = (LUNARIS_WEBHOOK_SENT or 0) + 1
-            LUNARIS_WEBHOOK_LAST_SENT_AT = os.clock()
-            LUNARIS_WEBHOOK_NEXT_AT = os.clock() + LUNARIS_WEBHOOK_INTERVAL
-            LUNARIS_WEBHOOK_LAST_STATUS = "✓ Sent successfully"
-            return true, response
-        end
-        LUNARIS_WEBHOOK_LAST_STATUS = string.format("HTTP %s", tostring(statusCode))
-        return false, response
-    end
-
-    LUNARIS_WEBHOOK_LAST_STATUS = "Request failed"
-    return false, response
-end
-
-local function LunarisResetWebhookStats(...)
-    LunarisStats.Divine = 0
-    LunarisStats.Eternal = 0
-    LunarisStats.Secret = 0
-    LUNARIS_WEBHOOK_SENT = 0
-    LUNARIS_WEBHOOK_LAST_STATUS = "Stats reset"
-    LUNARIS_WEBHOOK_NEXT_AT = os.clock() + LUNARIS_WEBHOOK_INTERVAL
-end
-
 local o=e.LocalPlayer
 local Window=nil
 local currentLang="EN"
 local executorCheckCaller=typeof(checkcaller)=="function" and checkcaller or function() return false end
 local safeNewCClosure=typeof(newcclosure)=="function" and newcclosure or function(fn) return fn end
-local V=game:GetService( "ProximityPromptService" )
-
--- Do not globally auto-fire every ProximityPrompt.
--- The previous global PromptButtonHoldBegan hook could trigger game LocalScripts
--- re-entrantly and produce repeated "attempt to call a nil value" errors.
-local function LunarisFirePrompt(prompt, holdDuration, ...)
-    if typeof(fireproximityprompt) ~= "function" or not prompt then
-        return false
-    end
-    local ok = pcall(function(...)
-        if holdDuration == nil then
-            fireproximityprompt(prompt)
-        else
-            fireproximityprompt(prompt, holdDuration)
+local V=game:GetService( "ProximityPromptService" )pcall(function(...) V.PromptButtonHoldBegan :Connect(function(e,...) pcall(function(...)
+            if typeof(fireproximityprompt)== "function" then
+                fireproximityprompt(e)
+            end
         end
-    end)
-    return ok
+        )
+    end
+    )
 end
+)
 local H=function(...)
 end
 local t=function(...)
@@ -1350,7 +1137,7 @@ d4=function(e,y,...)
             if r:IsA( "ProximityPrompt" )then
                 pcall(function(...) r.RequiresLineOfSight = false r.HoldDuration = 0
                     if typeof(fireproximityprompt)== "function" then
-                        LunarisFirePrompt(r, 0)
+                        fireproximityprompt(r, 0 )fireproximityprompt(r)
                     end
                 end
                 )
@@ -1366,7 +1153,7 @@ d4=function(e,y,...)
                     if r:IsA( "ProximityPrompt" )then
                         pcall(function(...) r.RequiresLineOfSight = false r.HoldDuration = 0
                             if typeof(fireproximityprompt)== "function" then
-                                LunarisFirePrompt(r, 0)
+                                fireproximityprompt(r, 0 )fireproximityprompt(r)
                             end
                         end
                         )
@@ -2373,7 +2160,7 @@ f4=function(e,...)
             for r,y in ipairs(k:GetDescendants())do
                 if y:IsA( "ProximityPrompt" )and y.Enabled then
                     if typeof(fireproximityprompt)== "function" then
-                        LunarisFirePrompt(y)
+                        fireproximityprompt(y)
                     end
                 end
             end
@@ -2381,7 +2168,7 @@ f4=function(e,...)
                 for r,y in ipairs(k.Parent :GetDescendants())do
                     if y:IsA( "ProximityPrompt" )and y.Enabled then
                         if typeof(fireproximityprompt)== "function" then
-                            LunarisFirePrompt(y)
+                            fireproximityprompt(y)
                         end
                     end
                 end
@@ -2595,7 +2382,7 @@ local function pk(...)
         for r,y in ipairs(r:GetDescendants())do
             if y:IsA( "ProximityPrompt" )and y.Enabled then
                 if typeof(fireproximityprompt)== "function" then
-                    LunarisFirePrompt(y, 0)
+                    fireproximityprompt(y, 0 )fireproximityprompt(y)
                 end
             end
             if y:IsA( "GuiButton" )and y.Visible then
@@ -3697,7 +3484,6 @@ l4=function(e,u,...)
         return false
     else
         h.statusText = "[7/7] Target Secured! Stashing into Backpack..." h.teleporting = false pcall(u4)
-        LunarisRecordStolenEgg(e)
         return true
     end
 end
@@ -3798,7 +3584,6 @@ local Ck=os.clock ()task.spawn (function(...)
                                     return
                                 end
                                 if r then
-                                    LunarisRecordStolenEgg(w)
                                     pcall(u4)
                                     if h.autoGlide then
                                         h.statusText = "[AutoSteal] Secured! Tweening to Safe Line X=525..." H( "[AutoSteal] Egg secured after Guard Strike! Returning smoothly to Safe Line X=525 along Z=-360..." )Q4(h.glideSpeed ,u)pcall(u4)
@@ -5315,168 +5100,8 @@ local function oM(...)
     end
     )A( "Get Out Treadmill" , "Instantly escape from treadmill or gear" ,Color3.fromRGB ( 249 , 115 , 22 ), 32 ,function(...) pcall(M4)pcall(C4)pcall(D4)
     end
-    )E( "DISCORD WEBHOOK" , 40 )
-    local Wh=Instance.new("Frame") Wh.Size=UDim2.new(1,0,0,294) Wh.BackgroundColor3=t Wh.LayoutOrder=41 Wh.Parent=n;
-    (Instance.new("UICorner",Wh)).CornerRadius=UDim.new(0,10)
-    local WhStroke=Instance.new("UIStroke",Wh) WhStroke.Color=Color3.fromRGB(50,58,78) WhStroke.Thickness=1 WhStroke.Transparency=0.35
-
-    local WhTitle=Instance.new("TextLabel") WhTitle.Size=UDim2.new(1,-24,0,22) WhTitle.Position=UDim2.new(0,12,0,9) WhTitle.BackgroundTransparency=1 WhTitle.Text="🌙 Lunaris Webhook Center" WhTitle.TextColor3=B WhTitle.TextSize=14 WhTitle.Font=Enum.Font.GothamBold WhTitle.TextXAlignment=Enum.TextXAlignment.Left WhTitle.AutoLocalize=false WhTitle.Parent=Wh
-    local WhSub=Instance.new("TextLabel") WhSub.Size=UDim2.new(1,-24,0,18) WhSub.Position=UDim2.new(0,12,0,31) WhSub.BackgroundTransparency=1 WhSub.Text="Stats-only Discord reports • no player/account data" WhSub.TextColor3=J WhSub.TextSize=10 WhSub.Font=Enum.Font.Gotham WhSub.TextXAlignment=Enum.TextXAlignment.Left WhSub.AutoLocalize=false WhSub.Parent=Wh
-
-    local WhBox=Instance.new("TextBox") WhBox.Size=UDim2.new(1,-24,0,30) WhBox.Position=UDim2.new(0,12,0,56) WhBox.BackgroundColor3=Color3.fromRGB(28,32,44) WhBox.TextColor3=B WhBox.PlaceholderColor3=Color3.fromRGB(120,130,150) WhBox.PlaceholderText="Enter Your Webhook" WhBox.Text=LunarisWebhookConfigured() and LUNARIS_WEBHOOK_URL or "" WhBox.ClearTextOnFocus=false WhBox.TextSize=11 WhBox.Font=Enum.Font.Gotham WhBox.TextXAlignment=Enum.TextXAlignment.Left WhBox.TextTruncate=Enum.TextTruncate.AtEnd WhBox.AutoLocalize=false WhBox.Parent=Wh
-    (Instance.new("UICorner",WhBox)).CornerRadius=UDim.new(0,7)
-
-    local WhSave=Instance.new("TextButton") WhSave.Size=UDim2.new(0.24,-4,0,28) WhSave.Position=UDim2.new(0,12,0,94) WhSave.BackgroundColor3=Color3.fromRGB(0,185,255) WhSave.Text="SAVE" WhSave.TextColor3=Color3.new(1,1,1) WhSave.TextSize=11 WhSave.Font=Enum.Font.GothamBold WhSave.AutoButtonColor=false WhSave.Parent=Wh
-    (Instance.new("UICorner",WhSave)).CornerRadius=UDim.new(0,7)
-
-    local WhTest=Instance.new("TextButton") WhTest.Size=UDim2.new(0.24,-4,0,28) WhTest.Position=UDim2.new(0.25,0,0,94) WhTest.BackgroundColor3=Color3.fromRGB(41,48,66) WhTest.Text="TEST" WhTest.TextColor3=B WhTest.TextSize=11 WhTest.Font=Enum.Font.GothamBold WhTest.AutoButtonColor=false WhTest.Parent=Wh
-    (Instance.new("UICorner",WhTest)).CornerRadius=UDim.new(0,7)
-
-    local WhNow=Instance.new("TextButton") WhNow.Size=UDim2.new(0.24,-4,0,28) WhNow.Position=UDim2.new(0.50,0,0,94) WhNow.BackgroundColor3=Color3.fromRGB(36,120,94) WhNow.Text="SEND NOW" WhNow.TextColor3=Color3.new(1,1,1) WhNow.TextSize=11 WhNow.Font=Enum.Font.GothamBold WhNow.AutoButtonColor=false WhNow.Parent=Wh
-    (Instance.new("UICorner",WhNow)).CornerRadius=UDim.new(0,7)
-
-    local WhClear=Instance.new("TextButton") WhClear.Size=UDim2.new(0.24,-4,0,28) WhClear.Position=UDim2.new(0.75,0,0,94) WhClear.BackgroundColor3=Color3.fromRGB(90,45,55) WhClear.Text="CLEAR" WhClear.TextColor3=B WhClear.TextSize=11 WhClear.Font=Enum.Font.GothamBold WhClear.AutoButtonColor=false WhClear.Parent=Wh
-    (Instance.new("UICorner",WhClear)).CornerRadius=UDim.new(0,7)
-
-    local WhToggle=Instance.new("TextButton") WhToggle.Size=UDim2.new(0.48,-6,0,30) WhToggle.Position=UDim2.new(0,12,0,130) WhToggle.BackgroundColor3=Color3.fromRGB(28,32,44) WhToggle.Text="" WhToggle.AutoButtonColor=false WhToggle.Parent=Wh
-    (Instance.new("UICorner",WhToggle)).CornerRadius=UDim.new(0,7)
-    local WhToggleText=Instance.new("TextLabel") WhToggleText.Size=UDim2.new(1,-16,1,0) WhToggleText.Position=UDim2.new(0,8,0,0) WhToggleText.BackgroundTransparency=1 WhToggleText.TextColor3=B WhToggleText.TextSize=11 WhToggleText.Font=Enum.Font.GothamBold WhToggleText.TextXAlignment=Enum.TextXAlignment.Left WhToggleText.Parent=WhToggle
-
-    local WhInterval=Instance.new("TextButton") WhInterval.Size=UDim2.new(0.48,-6,0,30) WhInterval.Position=UDim2.new(0.52,0,0,130) WhInterval.BackgroundColor3=Color3.fromRGB(41,48,66) WhInterval.Text="INTERVAL: 10M" WhInterval.TextColor3=B WhInterval.TextSize=11 WhInterval.Font=Enum.Font.GothamBold WhInterval.AutoButtonColor=false WhInterval.Parent=Wh
-    (Instance.new("UICorner",WhInterval)).CornerRadius=UDim.new(0,7)
-
-    local WhStats=Instance.new("Frame") WhStats.Size=UDim2.new(1,-24,0,54) WhStats.Position=UDim2.new(0,12,0,168) WhStats.BackgroundColor3=Color3.fromRGB(20,24,34) WhStats.Parent=Wh
-    (Instance.new("UICorner",WhStats)).CornerRadius=UDim.new(0,7)
-
-    local WhStat1=Instance.new("TextLabel") WhStat1.Size=UDim2.new(0.25,0,1,0) WhStat1.Position=UDim2.new(0,6,0,0) WhStat1.BackgroundTransparency=1 WhStat1.TextColor3=Color3.fromRGB(255,105,140) WhStat1.TextSize=11 WhStat1.Font=Enum.Font.GothamBold WhStat1.Parent=WhStats
-    local WhStat2=Instance.new("TextLabel") WhStat2.Size=UDim2.new(0.25,0,1,0) WhStat2.Position=UDim2.new(0.25,0,0,0) WhStat2.BackgroundTransparency=1 WhStat2.TextColor3=Color3.fromRGB(225,105,240) WhStat2.TextSize=11 WhStat2.Font=Enum.Font.GothamBold WhStat2.Parent=WhStats
-    local WhStat3=Instance.new("TextLabel") WhStat3.Size=UDim2.new(0.25,0,1,0) WhStat3.Position=UDim2.new(0.50,0,0,0) WhStat3.BackgroundTransparency=1 WhStat3.TextColor3=Color3.fromRGB(255,150,75) WhStat3.TextSize=11 WhStat3.Font=Enum.Font.GothamBold WhStat3.Parent=WhStats
-    local WhStat4=Instance.new("TextLabel") WhStat4.Size=UDim2.new(0.25,0,1,0) WhStat4.Position=UDim2.new(0.75,0,0,0) WhStat4.BackgroundTransparency=1 WhStat4.TextColor3=Color3.fromRGB(100,220,255) WhStat4.TextSize=11 WhStat4.Font=Enum.Font.GothamBold WhStat4.Parent=WhStats
-
-    local WhReset=Instance.new("TextButton") WhReset.Size=UDim2.new(1,-24,0,28) WhReset.Position=UDim2.new(0,12,0,228) WhReset.BackgroundColor3=Color3.fromRGB(41,48,66) WhReset.Text="RESET SESSION STATS" WhReset.TextColor3=B WhReset.TextSize=11 WhReset.Font=Enum.Font.GothamBold WhReset.AutoButtonColor=false WhReset.Parent=Wh
-    (Instance.new("UICorner",WhReset)).CornerRadius=UDim.new(0,7)
-
-    local WhInfo=Instance.new("TextLabel") WhInfo.Size=UDim2.new(1,-24,0,32) WhInfo.Position=UDim2.new(0,12,0,260) WhInfo.BackgroundTransparency=1 WhInfo.TextColor3=J WhInfo.TextSize=10 WhInfo.Font=Enum.Font.Gotham WhInfo.TextXAlignment=Enum.TextXAlignment.Left WhInfo.TextYAlignment=Enum.TextYAlignment.Top WhInfo.Parent=Wh
-
-    local function WhRefresh(...)
-        local uptime=math.max(0,math.floor(os.clock()-LunarisStartTime))
-        local nextIn=math.max(0,math.floor((LUNARIS_WEBHOOK_NEXT_AT>0 and LUNARIS_WEBHOOK_NEXT_AT or (os.clock()+LUNARIS_WEBHOOK_INTERVAL))-os.clock()))
-        local mins=math.max(1,math.floor((LUNARIS_WEBHOOK_INTERVAL or 600)/60))
-        WhStat1.Text="👑 "..tostring(LunarisStats.Divine or 0)
-        WhStat2.Text="⚡ "..tostring(LunarisStats.Eternal or 0)
-        WhStat3.Text="🔥 "..tostring(LunarisStats.Secret or 0)
-        WhStat4.Text="⏱ "..LunarisFormatUptime(uptime)
-        WhToggle.Text="Webhook Reports: "..(LUNARIS_WEBHOOK_ENABLED and "ON" or "OFF")
-        WhToggle.TextColor3=LUNARIS_WEBHOOK_ENABLED and Color3.fromRGB(0,255,160) or Color3.fromRGB(150,160,180)
-        WhInterval.Text="INTERVAL: "..tostring(mins).."M"
-        WhInfo.Text="Status: "..tostring(LUNARIS_WEBHOOK_LAST_STATUS)..
-            "   •   Next: "..(LUNARIS_WEBHOOK_ENABLED and LunarisFormatUptime(nextIn) or "Disabled")..
-            "   •   Reports: "..tostring(LUNARIS_WEBHOOK_SENT or 0)
-    end
-
-    WhSave.MouseButton1Click:Connect(function(...)
-        pcall(function()
-        local url=LunarisTrim(WhBox.Text)
-        if url~="" and string.find(url,"/api/webhooks/",1,true)==nil then
-            LUNARIS_WEBHOOK_LAST_STATUS="Invalid Discord webhook URL"
-        else
-            LUNARIS_WEBHOOK_URL=url
-            LUNARIS_WEBHOOK_ENABLED=url~=""
-            LUNARIS_WEBHOOK_LAST_STATUS=(url~="" and "Webhook saved" or "Webhook cleared")
-            LUNARIS_WEBHOOK_NEXT_AT=os.clock()+LUNARIS_WEBHOOK_INTERVAL
-            LunarisSaveWebhookConfig()
-        end
-        WhRefresh()
-        end)
-    end)
-
-    WhTest.MouseButton1Click:Connect(function(...)
-        pcall(function()
-        if not LunarisWebhookConfigured() then
-            LUNARIS_WEBHOOK_LAST_STATUS="Enter a valid webhook first"
-        else
-            task.spawn(function(...)
-                LUNARIS_WEBHOOK_LAST_STATUS="Sending test..."
-                WhRefresh()
-                local ok=LunarisSendUptimeWebhook()
-                LUNARIS_WEBHOOK_LAST_STATUS=ok and "✓ Test delivered" or LUNARIS_WEBHOOK_LAST_STATUS
-                WhRefresh()
-            end)
-        end
-        WhRefresh()
-        end)
-    end)
-
-    WhNow.MouseButton1Click:Connect(function(...)
-        pcall(function()
-        if not LunarisWebhookConfigured() then
-            LUNARIS_WEBHOOK_LAST_STATUS="Enter a valid webhook first"
-        else
-            task.spawn(function(...)
-                LUNARIS_WEBHOOK_LAST_STATUS="Sending report..."
-                WhRefresh()
-                LunarisSendUptimeWebhook()
-                WhRefresh()
-            end)
-        end
-        WhRefresh()
-        end)
-    end)
-
-    WhClear.MouseButton1Click:Connect(function(...)
-        pcall(function()
-        LUNARIS_WEBHOOK_URL=""
-        LUNARIS_WEBHOOK_ENABLED=false
-        WhBox.Text=""
-        LUNARIS_WEBHOOK_LAST_STATUS="Webhook cleared"
-        LunarisSaveWebhookConfig()
-        WhRefresh()
-        end)
-    end)
-
-    WhToggle.MouseButton1Click:Connect(function(...)
-        pcall(function()
-        LUNARIS_WEBHOOK_ENABLED=not LUNARIS_WEBHOOK_ENABLED
-        LUNARIS_WEBHOOK_NEXT_AT=os.clock()+LUNARIS_WEBHOOK_INTERVAL
-        LUNARIS_WEBHOOK_LAST_STATUS=LUNARIS_WEBHOOK_ENABLED and "Webhook enabled" or "Webhook disabled"
-        LunarisSaveWebhookConfig()
-        WhRefresh()
-        end)
-    end)
-
-    WhInterval.MouseButton1Click:Connect(function(...)
-        pcall(function()
-        local options={60,300,600,900,1800,3600}
-        local current=LUNARIS_WEBHOOK_INTERVAL or 600
-        local idx=1
-        for i,v in ipairs(options) do
-            if v==current then idx=i break end
-        end
-        idx=idx%#options+1
-        LUNARIS_WEBHOOK_INTERVAL=options[idx]
-        LUNARIS_WEBHOOK_NEXT_AT=os.clock()+LUNARIS_WEBHOOK_INTERVAL
-        LUNARIS_WEBHOOK_LAST_STATUS="Interval set to "..tostring(math.floor(LUNARIS_WEBHOOK_INTERVAL/60)).."m"
-        LunarisSaveWebhookConfig()
-        WhRefresh()
-        end)
-    end)
-
-    WhReset.MouseButton1Click:Connect(function(...)
-        pcall(function()
-        LunarisResetWebhookStats()
-        WhRefresh()
-        end)
-    end)
-
-    task.spawn(function(...)
-        while h and h.alive and Wh and Wh.Parent do
-            WhRefresh()
-            task.wait(1)
-        end
-    end)
-
-    )E( "CONTROLS & SETTINGS" , 50 )
-    local F=Instance.new ( "Frame" )F.Size =UDim2.new ( 1 , 0 , 0 , 48 )F.BackgroundColor3 =t F.LayoutOrder = 51 F.Parent =n;
+    )E( "CONTROLS & SETTINGS" , 40 )
+    local F=Instance.new ( "Frame" )F.Size =UDim2.new ( 1 , 0 , 0 , 48 )F.BackgroundColor3 =t F.LayoutOrder = 41 F.Parent =n;
     (Instance.new ( "UICorner" ,F)).CornerRadius =UDim.new ( 0 , 8 )
     local O=Instance.new ( "TextLabel" )O.Size =UDim2.new ( 1 , -130 , 0 , 18 )O.Position =UDim2.new ( 0 , 10 , 0 , 6 )O.BackgroundTransparency = 1 O.Text = "Flight Speed" O.TextColor3 =B O.TextSize = 13 O.Font =Enum.Font.GothamBold O.TextXAlignment =Enum.TextXAlignment.Left O.AutoLocalize = false O.Parent =F
     local T=Instance.new ( "TextLabel" )T.Size =UDim2.new ( 0 , 70 , 0 , 24 )T.Position =UDim2.new ( 1 , -80 , 0.5 , -12 )T.BackgroundColor3 =V T.Text =string.format ( "%d Studs/s" ,h.glideSpeed or 600 )T.TextColor3 =Color3.fromRGB ( 0 , 255 , 160 )T.TextSize = 11 T.Font =Enum.Font.GothamBold T.AutoLocalize = false T.Parent =F;
@@ -5488,12 +5113,12 @@ local function oM(...)
     end
     )m.MouseButton1Click :Connect(function(...) h.glideSpeed =math.min ( 1000 ,((h.glideSpeed or 600 ))+ 25 )T.Text =string.format ( "%d Studs/s" ,h.glideSpeed )Y(h.glideSpeed )
     end
-    )A( "Reset Character State" , "Clear velocity, cancel push & unfreeze" ,Color3.fromRGB ( 99 , 102 , 241 ), 52 ,function(...) pcall(D4)pcall(u4)
+    )A( "Reset Character State" , "Clear velocity, cancel push & unfreeze" ,Color3.fromRGB ( 99 , 102 , 241 ), 42 ,function(...) pcall(D4)pcall(u4)
     end
-    )A( "Unload Script" , "Destroy UI and stop all background loops" ,Color3.fromRGB ( 153 , 27 , 27 ), 53 ,function(...) aM()
+    )A( "Unload Script" , "Destroy UI and stop all background loops" ,Color3.fromRGB ( 153 , 27 , 27 ), 43 ,function(...) aM()
     end
-    )E( "EGG SELECT (ZONES & RARITIES)" , 55 )
-    local e4=Instance.new ( "TextButton" )e4.Size =UDim2.new ( 1 , 0 , 0 , 48 )e4.BackgroundColor3 =t e4.LayoutOrder = 56 e4.Text = "" e4.AutoButtonColor = false e4.Parent =n;
+    )E( "EGG SELECT (ZONES & RARITIES)" , 45 )
+    local e4=Instance.new ( "TextButton" )e4.Size =UDim2.new ( 1 , 0 , 0 , 48 )e4.BackgroundColor3 =t e4.LayoutOrder = 46 e4.Text = "" e4.AutoButtonColor = false e4.Parent =n;
     (Instance.new ( "UICorner" ,e4)).CornerRadius =UDim.new ( 0 , 8 )
     local function r4(...)
         local e= 0
@@ -5507,7 +5132,7 @@ local function oM(...)
     local w4=Instance.new ( "TextLabel" )w4.Size =UDim2.new ( 1 , -50 , 0 , 18 )w4.Position =UDim2.new ( 0 , 10 , 0 , 6 )w4.BackgroundTransparency = 1 w4.Text =string.format ( "📍 Target Zones (%d/12 Active)" ,r4())w4.TextColor3 =Color3.fromRGB ( 0 , 220 , 255 )w4.TextSize = 13 w4.Font =Enum.Font.GothamBold w4.TextXAlignment =Enum.TextXAlignment.Left w4.AutoLocalize = false w4.Parent =e4
     local j4=Instance.new ( "TextLabel" )j4.Size =UDim2.new ( 1 , -50 , 0 , 16 )j4.Position =UDim2.new ( 0 , 10 , 0 , 26 )j4.BackgroundTransparency = 1 j4.Text = "Click to expand / collapse zone selection" j4.TextColor3 =J j4.TextSize = 10 j4.Font =Enum.Font.Gotham j4.TextXAlignment =Enum.TextXAlignment.Left j4.AutoLocalize = false j4.Parent =e4
     local k4=Instance.new ( "TextLabel" )k4.Size =UDim2.new ( 0 , 30 , 0 , 30 )k4.Position =UDim2.new ( 1 , -38 , 0.5 , -15 )k4.BackgroundTransparency = 1 k4.Text = "▼" k4.TextColor3 =J k4.TextSize = 12 k4.Font =Enum.Font.GothamBold k4.Parent =e4
-    local a4=Instance.new ( "Frame" )a4.Size =UDim2.new ( 1 , 0 , 0 , 0 )a4.BackgroundColor3 =Color3.fromRGB ( 18 , 20 , 28 )a4.LayoutOrder = 57 a4.Visible = false a4.ClipsDescendants = true a4.Parent =n;
+    local a4=Instance.new ( "Frame" )a4.Size =UDim2.new ( 1 , 0 , 0 , 0 )a4.BackgroundColor3 =Color3.fromRGB ( 18 , 20 , 28 )a4.LayoutOrder = 47 a4.Visible = false a4.ClipsDescendants = true a4.Parent =n;
     (Instance.new ( "UICorner" ,a4)).CornerRadius =UDim.new ( 0 , 8 )
     local o4=Instance.new ( "UIGridLayout" )o4.CellSize =UDim2.new ( 0.48 , 0 , 0 , 32 )o4.CellPadding =UDim2.new ( 0.04 , 0 , 0 , 6 )o4.SortOrder =Enum.SortOrder.LayoutOrder o4.Parent =a4;
     (Instance.new ( "UIPadding" ,a4)).PaddingTop =UDim.new ( 0 , 8 )a4.UIPadding.PaddingBottom =UDim.new ( 0 , 8 )a4.UIPadding.PaddingLeft =UDim.new ( 0 , 8 )a4.UIPadding.PaddingRight =UDim.new ( 0 , 8 )
@@ -5543,12 +5168,12 @@ local function oM(...)
         end
         return e
     end
-    local s4=Instance.new ( "TextButton" )s4.Size =UDim2.new ( 1 , 0 , 0 , 48 )s4.BackgroundColor3 =t s4.LayoutOrder = 58 s4.Text = "" s4.AutoButtonColor = false s4.Parent =n;
+    local s4=Instance.new ( "TextButton" )s4.Size =UDim2.new ( 1 , 0 , 0 , 48 )s4.BackgroundColor3 =t s4.LayoutOrder = 48 s4.Text = "" s4.AutoButtonColor = false s4.Parent =n;
     (Instance.new ( "UICorner" ,s4)).CornerRadius =UDim.new ( 0 , 8 )
     local p4=Instance.new ( "TextLabel" )p4.Size =UDim2.new ( 1 , -50 , 0 , 18 )p4.Position =UDim2.new ( 0 , 10 , 0 , 6 )p4.BackgroundTransparency = 1 p4.Text =string.format ( "🥚 Target Rarities (%d/%d Active)" ,t4(),#X)p4.TextColor3 =Color3.fromRGB ( 255 , 180 , 0 )p4.TextSize = 13 p4.Font =Enum.Font.GothamBold p4.TextXAlignment =Enum.TextXAlignment.Left p4.AutoLocalize = false p4.Parent =s4
     local B4=Instance.new ( "TextLabel" )B4.Size =UDim2.new ( 1 , -50 , 0 , 16 )B4.Position =UDim2.new ( 0 , 10 , 0 , 26 )B4.BackgroundTransparency = 1 B4.Text = "Click to expand / collapse rarity selection" B4.TextColor3 =J B4.TextSize = 10 B4.Font =Enum.Font.Gotham B4.TextXAlignment =Enum.TextXAlignment.Left B4.AutoLocalize = false B4.Parent =s4
     local J4=Instance.new ( "TextLabel" )J4.Size =UDim2.new ( 0 , 30 , 0 , 30 )J4.Position =UDim2.new ( 1 , -38 , 0.5 , -15 )J4.BackgroundTransparency = 1 J4.Text = "▼" J4.TextColor3 =J J4.TextSize = 12 J4.Font =Enum.Font.GothamBold J4.Parent =s4
-    local K4=Instance.new ( "Frame" )K4.Size =UDim2.new ( 1 , 0 , 0 , 0 )K4.BackgroundColor3 =Color3.fromRGB ( 18 , 20 , 28 )K4.LayoutOrder = 59 K4.Visible = false K4.ClipsDescendants = true K4.Parent =n;
+    local K4=Instance.new ( "Frame" )K4.Size =UDim2.new ( 1 , 0 , 0 , 0 )K4.BackgroundColor3 =Color3.fromRGB ( 18 , 20 , 28 )K4.LayoutOrder = 49 K4.Visible = false K4.ClipsDescendants = true K4.Parent =n;
     (Instance.new ( "UICorner" ,K4)).CornerRadius =UDim.new ( 0 , 8 )
     local c4=Instance.new ( "UIGridLayout" )c4.CellSize =UDim2.new ( 0.48 , 0 , 0 , 32 )c4.CellPadding =UDim2.new ( 0.04 , 0 , 0 , 6 )c4.SortOrder =Enum.SortOrder.LayoutOrder c4.Parent =K4;
     (Instance.new ( "UIPadding" ,K4)).PaddingTop =UDim.new ( 0 , 8 )K4.UIPadding.PaddingBottom =UDim.new ( 0 , 8 )K4.UIPadding.PaddingLeft =UDim.new ( 0 , 8 )K4.UIPadding.PaddingRight =UDim.new ( 0 , 8 )
@@ -5577,24 +5202,7 @@ local function oM(...)
     end
     )
 end
-H( "[+] Initializing Lunaris ST CHEAT" )oM()
-LUNARIS_WEBHOOK_NEXT_AT = os.clock() + LUNARIS_WEBHOOK_INTERVAL
-task.spawn(function(...)
-    while h.alive do
-        if LUNARIS_WEBHOOK_ENABLED and LunarisWebhookConfigured() then
-            local now=os.clock()
-            if now >= (LUNARIS_WEBHOOK_NEXT_AT or 0) and not LunarisWebhookBusy then
-                local ok, err = pcall(LunarisSendUptimeWebhook)
-                if not ok then
-                    LUNARIS_WEBHOOK_LAST_STATUS = "Webhook error: " .. tostring(err)
-                end
-                LUNARIS_WEBHOOK_NEXT_AT = os.clock() + LUNARIS_WEBHOOK_INTERVAL
-            end
-        end
-        task.wait(1)
-    end
-end)
-task.spawn (function(...) task.wait ( 0.5 )A4()b4( true )C4()
+H( "[+] Initializing Lunaris ST CHEAT" )oM()task.spawn (function(...) task.wait ( 0.5 )A4()b4( true )C4()
     if o.Character then
         z4(o.Character )
     end
