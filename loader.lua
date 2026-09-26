@@ -7,6 +7,198 @@ local j=game:GetService( "ReplicatedStorage" )
 local k=game:GetService( "ProximityPromptService" )
 local a=game:GetService( "HttpService" )
 local TeleportService=game:GetService( "TeleportService" )
+
+-- Lunaris Discord uptime monitor (stats-only; no player/account data is sent)
+local LUNARIS_WEBHOOK_CONFIG_FILE = "Lunaris_Webhook.json"
+local LUNARIS_WEBHOOK_URL = ""
+local LUNARIS_WEBHOOK_ENABLED = true
+local LUNARIS_WEBHOOK_INTERVAL = 600 -- 10 minutes
+local LUNARIS_WEBHOOK_SENT = 0
+local LUNARIS_WEBHOOK_LAST_STATUS = "Not configured"
+local LUNARIS_WEBHOOK_LAST_SENT_AT = 0
+local LUNARIS_WEBHOOK_NEXT_AT = 0
+local LUNARIS_WEBHOOK_BUSY = false
+
+local LunarisStats = { Divine = 0, Eternal = 0, Secret = 0 }
+local LunarisStartTime = os.clock()
+
+local function LunarisTrim(v, ...)
+    return tostring(v or ""):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function LunarisFormatUptime(seconds, ...)
+    seconds = math.max(0, math.floor(tonumber(seconds) or 0))
+    local days = math.floor(seconds / 86400)
+    seconds = seconds % 86400
+    local hours = math.floor(seconds / 3600)
+    seconds = seconds % 3600
+    local minutes = math.floor(seconds / 60)
+    seconds = seconds % 60
+    if days > 0 then
+        return string.format("%dd %02d:%02d:%02d", days, hours, minutes, seconds)
+    end
+    return string.format("%02d:%02d:%02d", hours, minutes, seconds)
+end
+
+local function LunarisWebhookConfigured(...)
+    local url = LunarisTrim(LUNARIS_WEBHOOK_URL)
+    return url ~= "" and string.find(url, "/api/webhooks/", 1, true) ~= nil
+end
+
+local function LunarisSaveWebhookConfig(...)
+    pcall(function(...)
+        if not writefile then
+            return
+        end
+        local data = {
+            webhook = LunarisTrim(LUNARIS_WEBHOOK_URL),
+            enabled = LUNARIS_WEBHOOK_ENABLED == true,
+            interval = math.floor(tonumber(LUNARIS_WEBHOOK_INTERVAL) or 600),
+        }
+        writefile(LUNARIS_WEBHOOK_CONFIG_FILE, a:JSONEncode(data))
+    end)
+end
+
+pcall(function(...)
+    if isfile and readfile and isfile(LUNARIS_WEBHOOK_CONFIG_FILE) then
+        local raw = readfile(LUNARIS_WEBHOOK_CONFIG_FILE)
+        local data = raw and a:JSONDecode(raw) or nil
+        if type(data) == "table" then
+            LUNARIS_WEBHOOK_URL = LunarisTrim(data.webhook)
+            if data.enabled ~= nil then
+                LUNARIS_WEBHOOK_ENABLED = data.enabled == true
+            end
+            local interval = tonumber(data.interval)
+            if interval then
+                LUNARIS_WEBHOOK_INTERVAL = math.clamp(math.floor(interval), 60, 3600)
+            end
+        end
+    end
+end)
+
+local function LunarisClassifyRarity(egg, ...)
+    if type(egg) ~= "table" then
+        return nil
+    end
+    local rarity = string.lower(tostring(egg.Rarity or ""))
+    if string.find(rarity, "divine", 1, true) then
+        return "Divine"
+    elseif string.find(rarity, "eternal", 1, true) then
+        return "Eternal"
+    elseif string.find(rarity, "secret", 1, true) then
+        return "Secret"
+    end
+    local tier = tonumber(egg.RarityTier)
+    if tier == 6 then
+        return "Divine"
+    elseif tier == 5 then
+        return "Eternal"
+    elseif tier == 4 then
+        return "Secret"
+    end
+    return nil
+end
+
+local function LunarisRecordStolenEgg(egg, ...)
+    local rarity = LunarisClassifyRarity(egg)
+    if rarity then
+        LunarisStats[rarity] = (LunarisStats[rarity] or 0) + 1
+    end
+end
+
+local function LunarisGetRequestFunction(...)
+    local candidates = {
+        (typeof(request) == "function" and request) or nil,
+        (typeof(http_request) == "function" and http_request) or nil,
+        (syn and typeof(syn.request) == "function" and syn.request) or nil,
+    }
+    for _, fn in ipairs(candidates) do
+        if typeof(fn) == "function" then
+            return fn
+        end
+    end
+    return nil
+end
+
+local function LunarisSendUptimeWebhook(...)
+    if LunarisWebhookBusy then
+        return false, "Webhook request already running"
+    end
+    if not LUNARIS_WEBHOOK_ENABLED then
+        LUNARIS_WEBHOOK_LAST_STATUS = "Disabled"
+        return false, "Webhook disabled"
+    end
+    local url = LunarisTrim(LUNARIS_WEBHOOK_URL)
+    if not LunarisWebhookConfigured() then
+        LUNARIS_WEBHOOK_LAST_STATUS = "Webhook not configured"
+        return false, "Webhook URL not configured"
+    end
+
+    local requestFn = LunarisGetRequestFunction()
+    if typeof(requestFn) ~= "function" then
+        LUNARIS_WEBHOOK_LAST_STATUS = "HTTP request unsupported"
+        return false, "No supported HTTP request function"
+    end
+
+    local uptime = os.clock() - LunarisStartTime
+    local payload = {
+        username = "Lunaris",
+        embeds = {{
+            title = "🌙 Lunaris — Uptime Check",
+            color = 10181046,
+            fields = {
+                { name = "👑 Divine Egg Stolen", value = tostring(LunarisStats.Divine or 0), inline = true },
+                { name = "⚡ Ethernal Egg Stolen", value = tostring(LunarisStats.Eternal or 0), inline = true },
+                { name = "🔥 Secret Egg Stolen", value = tostring(LunarisStats.Secret or 0), inline = true },
+                { name = "⏱️ Total Uptime", value = LunarisFormatUptime(uptime), inline = true },
+                { name = "🔁 Interval", value = string.format("%dm", math.floor(LUNARIS_WEBHOOK_INTERVAL / 60)), inline = true },
+                { name = "📨 Reports Sent", value = tostring(LUNARIS_WEBHOOK_SENT or 0), inline = true },
+            },
+            footer = { text = "Lunaris Uptime Monitor" },
+        }},
+    }
+
+    local okEncode, body = pcall(a.JSONEncode, a, payload)
+    if not okEncode then
+        LUNARIS_WEBHOOK_LAST_STATUS = "Payload encode failed"
+        return false, body
+    end
+
+    LunarisWebhookBusy = true
+    local ok, response = pcall(requestFn, {
+        Url = url,
+        Method = "POST",
+        Headers = { ["Content-Type"] = "application/json" },
+        Body = body,
+    })
+    LunarisWebhookBusy = false
+
+    if ok then
+        local statusCode = type(response) == "table" and tonumber(response.StatusCode) or nil
+        if not statusCode or (statusCode >= 200 and statusCode < 300) then
+            LUNARIS_WEBHOOK_SENT = (LUNARIS_WEBHOOK_SENT or 0) + 1
+            LUNARIS_WEBHOOK_LAST_SENT_AT = os.clock()
+            LUNARIS_WEBHOOK_NEXT_AT = os.clock() + LUNARIS_WEBHOOK_INTERVAL
+            LUNARIS_WEBHOOK_LAST_STATUS = "✓ Sent successfully"
+            return true, response
+        end
+        LUNARIS_WEBHOOK_LAST_STATUS = string.format("HTTP %s", tostring(statusCode))
+        return false, response
+    end
+
+    LUNARIS_WEBHOOK_LAST_STATUS = "Request failed"
+    return false, response
+end
+
+local function LunarisResetWebhookStats(...)
+    LunarisStats.Divine = 0
+    LunarisStats.Eternal = 0
+    LunarisStats.Secret = 0
+    LUNARIS_WEBHOOK_SENT = 0
+    LUNARIS_WEBHOOK_LAST_STATUS = "Stats reset"
+    LUNARIS_WEBHOOK_NEXT_AT = os.clock() + LUNARIS_WEBHOOK_INTERVAL
+end
+
 local o=e.LocalPlayer
 local Window=nil
 local currentLang="EN"
@@ -122,8 +314,8 @@ local b= 620
 local A= 130
 local S=CFrame.new ( 4773.7587890625 , 70.392112731934 , -315.73501586914 )
 
-local Z= "NYXEONHub_FlightSpeed.txt"
-local z= "NYXEONHub_EggSelectConfig.json"
+local Z= "LunarisHub_FlightSpeed.txt"
+local z= "LunarisHub_EggSelectConfig.json"
 local d={[ "Light Dark" ]=Color3.fromRGB ( 168 , 85 , 247 ),[ "Titan Temple" ]=Color3.fromRGB ( 245 , 158 , 11 );
 [ "Cherry Blossom" ]=Color3.fromRGB ( 236 , 72 , 153 );
 [ "Cosmic" ]=Color3.fromRGB ( 6 , 182 , 212 ),[ "Prehistoric" ]=Color3.fromRGB ( 16 , 185 , 129 ),[ "Abyss Ocean" ]=Color3.fromRGB ( 59 , 130 , 246 );
@@ -3484,6 +3676,7 @@ l4=function(e,u,...)
         return false
     else
         h.statusText = "[7/7] Target Secured! Stashing into Backpack..." h.teleporting = false pcall(u4)
+        LunarisRecordStolenEgg(e)
         return true
     end
 end
@@ -3584,6 +3777,7 @@ local Ck=os.clock ()task.spawn (function(...)
                                     return
                                 end
                                 if r then
+                                    LunarisRecordStolenEgg(w)
                                     pcall(u4)
                                     if h.autoGlide then
                                         h.statusText = "[AutoSteal] Secured! Tweening to Safe Line X=525..." H( "[AutoSteal] Egg secured after Guard Strike! Returning smoothly to Safe Line X=525 along Z=-360..." )Q4(h.glideSpeed ,u)pcall(u4)
@@ -3769,7 +3963,7 @@ local function fk(e,...) pcall(function(...)
     )
 end
 local function Mk(...) h.performanceMode = true pcall(function(...)
-        local e=r:FindFirstChild( "NYXEONHub_EggESP" )
+        local e=r:FindFirstChild( "LunarisHub_EggESP" )
         if e then
             e:Destroy()
         end
@@ -3950,7 +4144,7 @@ local function Zk(e,...)
     end
     return table.concat (u)
 end
-local zk= "NYXEON_Hub_Icon.png"
+local zk= "Lunaris_Hub_Icon.png"
 local dk= "rbxassetid://10734950309" pcall(function(...)
     if writefile and((getcustomasset or getsynasset))then
         local e=getcustomasset or getsynasset
@@ -4012,68 +4206,68 @@ local Gk={[ "EN" ]={[ "StatusTagReady" ]= "Status: Ready" ,[ "Tabs" ]={[ "Farm" 
 [ "BuyTrailsStopped" ]= "Auto Buy Trails disabled" ;
 [ "HideNotEnoughMoneyStarted" ]= "Hide 'Not Enough Money' alert enabled" ,[ "HideNotEnoughMoneyStopped" ]= "Hide 'Not Enough Money' alert disabled" ,[ "GodmodeStarted" ]= "Godmode enabled" ,[ "GodmodeStopped" ]= "Godmode disabled" ,[ "PerformanceStarted" ]= "Ultra Potato Mode enabled (Textures & effects removed)" ;
 [ "PerformanceStopped" ]= "Ultra Potato Mode disabled" ;
-[ "Disable3DStarted" ]= "3D Rendering disabled (GPU Saver Active)" ,[ "Disable3DStopped" ]= "3D Rendering restored" ,[ "AntiAFKStarted" ]= "Anti-AFK enabled (Double-Esc 10m & Mobile support)" ,[ "AntiAFKStopped" ]= "Anti-AFK disabled" ,[ "LangSwitched" ]= "Language switched to English successfully!" }},[ "TH" ]={[ "StatusTagReady" ]= "à¸ªà¸–à¸²à¸™à¸°: à¸žà¸£à¹‰à¸­à¸¡à¸—à¸³à¸‡à¸²à¸™" ,[ "Tabs" ]={[ "Farm" ]= "à¸£à¸°à¸šà¸šà¸Ÿà¸²à¸£à¹Œà¸¡" ;
-[ "EggSelect" ]= "à¹€à¸¥à¸·à¸­à¸à¸›à¸£à¸°à¹€à¸ à¸—à¹„à¸‚à¹ˆ" ,[ "Character" ]= "à¸•à¸±à¸§à¸¥à¸°à¸„à¸£" ;
-[ "Settings" ]= "à¸•à¸±à¹‰à¸‡à¸„à¹ˆà¸²" },[ "EggSelect" ]={[ "SecZones" ]= "à¹€à¸¥à¸·à¸­à¸à¹‚à¸‹à¸™à¹€à¸›à¹‰à¸²à¸«à¸¡à¸²à¸¢" ,[ "SecZonesDesc" ]= "à¹€à¸¥à¸·à¸­à¸à¹‚à¸‹à¸™à¸—à¸µà¹ˆà¸•à¹‰à¸­à¸‡à¸à¸²à¸£à¹„à¸›à¸‚à¹‚à¸¡à¸¢à¹„à¸‚à¹ˆ (à¹„à¸‚à¹ˆà¸£à¸°à¸”à¸±à¸š Secret à¸‚à¸¶à¹‰à¸™à¹„à¸›à¸ˆà¸°à¹„à¸¡à¹ˆà¸ªà¸™à¹‚à¸‹à¸™)" ,[ "DropZonesTitle" ]= "à¹‚à¸‹à¸™à¹€à¸›à¹‰à¸²à¸«à¸¡à¸²à¸¢à¸—à¸µà¹ˆà¹€à¸¥à¸·à¸­à¸" ,[ "DropZonesDesc" ]= "à¸„à¸¥à¸´à¸à¹€à¸žà¸·à¹ˆà¸­à¹€à¸¥à¸·à¸­à¸à¹‚à¸‹à¸™à¸—à¸µà¹ˆà¸•à¹‰à¸­à¸‡à¸à¸²à¸£à¸‚à¹‚à¸¡à¸¢à¹„à¸‚à¹ˆ" ,[ "SecRarities" ]= "à¹€à¸¥à¸·à¸­à¸à¸£à¸°à¸”à¸±à¸šà¸„à¸§à¸²à¸¡à¸«à¸²à¸¢à¸²à¸" ,[ "SecRaritiesDesc" ]= "à¹€à¸¥à¸·à¸­à¸à¸£à¸°à¸”à¸±à¸šà¸„à¸§à¸²à¸¡à¸«à¸²à¸¢à¸²à¸à¸‚à¸­à¸‡à¹„à¸‚à¹ˆà¸—à¸µà¹ˆà¸•à¹‰à¸­à¸‡à¸à¸²à¸£à¸‚à¹‚à¸¡à¸¢" ,[ "DropRaritiesTitle" ]= "à¸£à¸°à¸”à¸±à¸šà¸„à¸§à¸²à¸¡à¸«à¸²à¸¢à¸²à¸à¸—à¸µà¹ˆà¹€à¸¥à¸·à¸­à¸" ;
-[ "DropRaritiesDesc" ]= "à¸„à¸¥à¸´à¸à¹€à¸žà¸·à¹ˆà¸­à¹€à¸¥à¸·à¸­à¸à¸£à¸°à¸”à¸±à¸šà¸„à¸§à¸²à¸¡à¸«à¸²à¸¢à¸²à¸à¸—à¸µà¹ˆà¸•à¹‰à¸­à¸‡à¸à¸²à¸£à¸‚à¹‚à¸¡à¸¢" ;
-[ "AlwaysSecretPlus" ]= "à¹€à¸à¹‡à¸šà¹„à¸‚à¹ˆ Secret+ à¸—à¸¸à¸à¹‚à¸‹à¸™à¹€à¸ªà¸¡à¸­" ;
-[ "AlwaysSecretPlusDesc" ]= "à¸‚à¹‚à¸¡à¸¢à¹„à¸‚à¹ˆà¸£à¸°à¸”à¸±à¸š Secret, Eternal, Divine à¸—à¸±à¸™à¸—à¸µà¹„à¸¡à¹ˆà¸§à¹ˆà¸²à¸ˆà¸°à¹€à¸à¸´à¸”à¸—à¸µà¹ˆà¹‚à¸‹à¸™à¹ƒà¸”" };
-[ "Farm" ]={[ "SecModes" ]= "à¹‚à¸«à¸¡à¸”à¸‚à¹‚à¸¡à¸¢à¹„à¸‚à¹ˆà¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´" ,[ "TweenTitle" ]= "à¸‚à¹‚à¸¡à¸¢à¹„à¸‚à¹ˆà¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´ (à¸šà¸´à¸™à¹€à¸£à¹‡à¸§)" ,[ "TweenDesc" ]= "à¸šà¸´à¸™à¹„à¸›à¸‚à¹‚à¸¡à¸¢à¹„à¸‚à¹ˆà¹à¸¥à¸°à¹€à¸à¹‡à¸šà¹ƒà¸ªà¹ˆà¸à¸£à¸°à¹€à¸›à¹‹à¸²à¸­à¸¢à¹ˆà¸²à¸‡à¸•à¹ˆà¸­à¹€à¸™à¸·à¹ˆà¸­à¸‡à¸•à¸²à¸¡à¸—à¸²à¸‡à¸”à¹ˆà¸§à¸™à¸„à¸§à¸²à¸¡à¹€à¸£à¹‡à¸§à¸ªà¸¹à¸‡" ,[ "TeleportTitle" ]= "à¸‚à¹‚à¸¡à¸¢à¹„à¸‚à¹ˆà¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´ (à¸§à¸²à¸£à¹Œà¸›)" ;
-[ "TeleportDesc" ]= "à¸§à¸²à¸£à¹Œà¸›à¹„à¸›à¸‚à¹‚à¸¡à¸¢à¹„à¸‚à¹ˆà¸­à¸¢à¹ˆà¸²à¸‡à¸£à¸§à¸”à¹€à¸£à¹‡à¸§à¹à¸¥à¸°à¸•à¹ˆà¸­à¹€à¸™à¸·à¹ˆà¸­à¸‡" ,[ "SingleTitle" ]= "à¸‚à¹‚à¸¡à¸¢à¹„à¸‚à¹ˆà¹ƒà¸šà¹€à¸”à¸µà¸¢à¸§" ,[ "SingleDesc" ]= "à¸§à¸²à¸£à¹Œà¸›à¹„à¸›à¸‚à¹‚à¸¡à¸¢à¹„à¸‚à¹ˆà¹€à¸›à¹‰à¸²à¸«à¸¡à¸²à¸¢ 1 à¹ƒà¸šà¹à¸¥à¹‰à¸§à¸à¸¥à¸±à¸šà¸¡à¸²à¸—à¸µà¹ˆà¸à¸²à¸™à¸—à¸±à¸™à¸—à¸µ" ;
-[ "SecPlace" ]= "à¸™à¸³à¸ªà¹ˆà¸‡à¹à¸¥à¸°à¸Ÿà¸±à¸à¹„à¸‚à¹ˆ" ;
-[ "PlaceTitle" ]= "à¸§à¸²à¸‡à¹„à¸‚à¹ˆà¹ƒà¸™à¸£à¸±à¸‡" ;
-[ "PlaceDesc" ]= "à¸šà¸´à¸™à¸à¸¥à¸±à¸šà¸šà¹‰à¸²à¸™à¹à¸¥à¸°à¸™à¸³à¹„à¸‚à¹ˆà¹ƒà¸™à¸•à¸±à¸§à¹„à¸›à¸§à¸²à¸‡à¸šà¸™à¹à¸—à¹ˆà¸™à¸Ÿà¸±à¸à¸—à¸µà¹ˆà¸§à¹ˆà¸²à¸‡à¹à¸¥à¹‰à¸§à¹€à¸£à¸´à¹ˆà¸¡à¸Ÿà¸±à¸à¸—à¸±à¸™à¸—à¸µ" ,[ "AutoPlaceTitle" ]= "à¸§à¸²à¸‡à¹„à¸‚à¹ˆà¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´ (à¸—à¸¸à¸ 5 à¸Ÿà¸­à¸‡)" ,[ "AutoPlaceDesc" ]= "à¸à¸¥à¸±à¸šà¸šà¹‰à¸²à¸™à¸—à¸¸à¸à¸„à¸£à¸±à¹‰à¸‡à¸—à¸µà¹ˆà¸‚à¹‚à¸¡à¸¢à¸„à¸£à¸š 5 à¸Ÿà¸­à¸‡à¹€à¸žà¸·à¹ˆà¸­à¸™à¸³à¹„à¸‚à¹ˆà¹„à¸›à¸§à¸²à¸‡" ;
-[ "HatchTitle" ]= "à¸Ÿà¸±à¸à¹„à¸‚à¹ˆà¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´" ,[ "HatchDesc" ]= "à¸ªà¸±à¹ˆà¸‡à¸Ÿà¸±à¸à¹„à¸‚à¹ˆà¸—à¸µà¹ˆà¸žà¸£à¹‰à¸­à¸¡à¸Ÿà¸±à¸à¸­à¸¢à¹ˆà¸²à¸‡à¸•à¹ˆà¸­à¹€à¸™à¸·à¹ˆà¸­à¸‡à¸ˆà¸²à¸à¸—à¸¸à¸à¸—à¸µà¹ˆ" ;
-[ "ReturnTitle" ]= "à¸šà¸´à¸™à¸à¸¥à¸±à¸šà¸žà¸·à¹‰à¸™à¸—à¸µà¹ˆà¸›à¸¥à¸­à¸”à¸ à¸±à¸¢" ,[ "ReturnDesc" ]= "à¸šà¸´à¸™à¸à¸¥à¸±à¸šà¹€à¸‚à¹‰à¸²à¸žà¸·à¹‰à¸™à¸—à¸µà¹ˆà¸›à¸¥à¸­à¸”à¸ à¸±à¸¢à¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´à¸«à¸¥à¸±à¸‡à¸‚à¹‚à¸¡à¸¢à¹„à¸‚à¹ˆà¹€à¸ªà¸£à¹‡à¸ˆ" ;
-[ "AutoTreadmillTitle" ]= "à¸§à¸´à¹ˆà¸‡à¸¥à¸¹à¹ˆà¸§à¸´à¹ˆà¸‡à¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´" ;
-[ "AutoTreadmillDesc" ]= "à¹„à¸›à¸§à¸´à¹ˆà¸‡à¸šà¸™à¸¥à¸¹à¹ˆà¸§à¸´à¹ˆà¸‡à¸—à¸µà¹ˆà¸šà¹‰à¸²à¸™à¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´à¹€à¸¡à¸·à¹ˆà¸­à¹„à¸¡à¹ˆà¸¡à¸µà¹„à¸‚à¹ˆà¸•à¸²à¸¡à¸—à¸µà¹ˆà¹€à¸¥à¸·à¸­à¸à¹€à¸à¸´à¸”" ;
-[ "UpgradeTreadmillTitle" ]= "à¸­à¸±à¸›à¹€à¸à¸£à¸”à¸¥à¸¹à¹ˆà¸§à¸´à¹ˆà¸‡à¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´" ;
-[ "UpgradeTreadmillDesc" ]= "à¸­à¸±à¸›à¹€à¸à¸£à¸”à¸£à¸°à¸”à¸±à¸šà¸¥à¸¹à¹ˆà¸§à¸´à¹ˆà¸‡à¸—à¸µà¹ˆà¸šà¹‰à¸²à¸™à¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´à¸—à¸±à¸™à¸—à¸µà¸—à¸µà¹ˆà¸¡à¸µà¹€à¸‡à¸´à¸™à¸žà¸­" ;
-[ "BuyTrailsTitle" ]= "à¸‹à¸·à¹‰à¸­à¹à¸¥à¸°à¹ƒà¸ªà¹ˆ Trail à¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´" ,[ "BuyTrailsDesc" ]= "à¸‹à¸·à¹‰à¸­à¹€à¸ªà¹‰à¸™à¸—à¸²à¸‡à¹€à¸žà¸´à¹ˆà¸¡à¸„à¸§à¸²à¸¡à¹€à¸£à¹‡à¸§à¹à¸¥à¸°à¸ªà¸§à¸¡à¹ƒà¸ªà¹ˆà¸­à¸±à¸™à¸—à¸µà¹ˆà¸”à¸µà¸—à¸µà¹ˆà¸ªà¸¸à¸”à¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´à¹€à¸¡à¸·à¹ˆà¸­à¹€à¸‡à¸´à¸™à¸žà¸­" ;
-[ "HideNotEnoughMoneyTitle" ]= "à¸‹à¹ˆà¸­à¸™à¹à¸ˆà¹‰à¸‡à¹€à¸•à¸·à¸­à¸™à¹€à¸‡à¸´à¸™à¹„à¸¡à¹ˆà¸žà¸­" ;
-[ "HideNotEnoughMoneyDesc" ]= "à¸šà¸¥à¹‡à¸­à¸à¹à¸¥à¸°à¸‹à¹ˆà¸­à¸™à¸‚à¹‰à¸­à¸„à¸§à¸²à¸¡à¸ªà¸µà¹à¸”à¸‡ 'Not enough money' à¸ˆà¸²à¸à¸•à¸±à¸§à¹€à¸à¸¡à¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´" };
-[ "Character" ]={[ "SecSafety" ]= "à¸„à¸§à¸²à¸¡à¸›à¸¥à¸­à¸”à¸ à¸±à¸¢à¹à¸¥à¸°à¸•à¸±à¸§à¸¥à¸°à¸„à¸£" ;
-[ "GodmodeTitle" ]= "à¹‚à¸«à¸¡à¸”à¸­à¸¡à¸•à¸°" ;
-[ "GodmodeDesc" ]= "à¸›à¹‰à¸­à¸‡à¸à¸±à¸™à¸”à¸²à¹€à¸¡à¸ˆà¸ˆà¸²à¸à¸ªà¸´à¹ˆà¸‡à¸à¸µà¸”à¸‚à¸§à¸²à¸‡à¹à¸¥à¸°à¸à¸±à¸šà¸”à¸±à¸ 100%" ;
-[ "UnstickTitle" ]= "à¹à¸à¹‰à¸•à¸±à¸§à¸•à¸´à¸” / à¸¥à¸‡à¸ˆà¸²à¸à¸¥à¸¹à¹ˆà¸§à¸´à¹ˆà¸‡" ,[ "UnstickDesc" ]= "à¸«à¸¥à¸¸à¸”à¸­à¸­à¸à¸ˆà¸²à¸à¸ªà¸´à¹ˆà¸‡à¸à¸µà¸”à¸‚à¸§à¸²à¸‡à¸«à¸£à¸·à¸­à¸­à¸¸à¸›à¸à¸£à¸“à¹Œà¸—à¸±à¸™à¸—à¸µ" ,[ "SecFlight" ]= "à¸à¸²à¸£à¸•à¸±à¹‰à¸‡à¸„à¹ˆà¸²à¸à¸²à¸£à¸šà¸´à¸™" ,[ "SpeedTitle" ]= "à¸„à¸§à¸²à¸¡à¹€à¸£à¹‡à¸§à¸à¸²à¸£à¸šà¸´à¸™" ;
-[ "SpeedDesc" ]= "à¸›à¸£à¸±à¸šà¸„à¸§à¸²à¸¡à¹€à¸£à¹‡à¸§à¹ƒà¸™à¸à¸²à¸£à¸šà¸´à¸™ (Studs/à¸§à¸´à¸™à¸²à¸—à¸µ)" };
-[ "Settings" ]={[ "SecDashboard" ]= "à¹à¸”à¸Šà¸šà¸­à¸£à¹Œà¸”à¸ªà¸–à¸²à¸™à¸°à¸ªà¸”" ;
-[ "DashTitle" ]= "à¹à¸”à¸Šà¸šà¸­à¸£à¹Œà¸”à¸ªà¸–à¸²à¸™à¸°à¸ªà¸”" ;
-[ "DashDesc" ]= "à¸ªà¸–à¸²à¸™à¸°: %s\nà¹‚à¸«à¸¡à¸”à¸Ÿà¸²à¸£à¹Œà¸¡: %s\nà¸ˆà¸³à¸™à¸§à¸™à¹„à¸‚à¹ˆà¹ƒà¸™à¸•à¸±à¸§: %d à¸Ÿà¸­à¸‡\nà¸„à¸§à¸²à¸¡à¹€à¸£à¹‡à¸§à¸à¸²à¸£à¸šà¸´à¸™: %d Studs/à¸§à¸´" ;
-[ "SecBlacklist" ]= "à¸•à¸±à¸§à¹€à¸¥à¸·à¸­à¸à¹‚à¸‹à¸™à¸—à¸µà¹ˆà¸•à¹‰à¸­à¸‡à¸à¸²à¸£" ;
-[ "BlacklistToggleTitle" ]= "à¸‚à¹‚à¸¡à¸¢à¹ƒà¸™à¹‚à¸‹à¸™: %s" ,[ "BlacklistToggleDesc" ]= "à¹€à¸›à¸´à¸”/à¸›à¸´à¸” à¸à¸²à¸£à¸‚à¹‚à¸¡à¸¢à¹„à¸‚à¹ˆà¸—à¸±à¹ˆà¸§à¹„à¸›à¹ƒà¸™à¹‚à¸‹à¸™ %s (à¸£à¸°à¸”à¸±à¸š Secret+ à¸ˆà¸°à¹€à¸à¹‡à¸šà¹€à¸ªà¸¡à¸­)" ;
-[ "SecUI" ]= "à¸›à¸£à¸±à¸šà¹à¸•à¹ˆà¸‡à¸«à¸™à¹‰à¸²à¸•à¹ˆà¸²à¸‡" ;
-[ "TranspTitle" ]= "à¸„à¸§à¸²à¸¡à¹‚à¸›à¸£à¹ˆà¸‡à¹ƒà¸ªà¸‚à¸­à¸‡à¸«à¸™à¹‰à¸²à¸•à¹ˆà¸²à¸‡" ,[ "TranspDesc" ]= "à¸›à¸£à¸±à¸šà¸„à¸§à¸²à¸¡à¹‚à¸›à¸£à¹ˆà¸‡à¹à¸ªà¸‡à¸‚à¸­à¸‡à¸žà¸·à¹‰à¸™à¸«à¸¥à¸±à¸‡à¸«à¸™à¹‰à¸²à¸•à¹ˆà¸²à¸‡ (0% - 90%)" ;
-[ "ThemeTitle" ]= "à¹€à¸¥à¸·à¸­à¸à¸˜à¸µà¸¡à¸«à¸™à¹‰à¸²à¸•à¹ˆà¸²à¸‡" ;
-[ "SecPerformance" ]= "à¸›à¸£à¸°à¸ªà¸´à¸—à¸˜à¸´à¸ à¸²à¸žà¹à¸¥à¸°à¸à¸£à¸²à¸Ÿà¸´à¸" ;
-[ "PerformanceTitle" ]= "à¹‚à¸«à¸¡à¸”à¸ à¸²à¸žà¸à¸²à¸à¸‚à¸±à¹‰à¸™à¸ªà¸¸à¸” (Ultra Potato Mode)" ;
-[ "PerformanceDesc" ]= "à¸¥à¸”à¸à¸£à¸²à¸Ÿà¸´à¸ à¸¥à¸š Texture à¸‚à¸­à¸‡à¹‚à¸¡à¹€à¸”à¸¥ à¸›à¸´à¸”à¹€à¸‡à¸² à¸›à¸´à¸”à¹à¸ªà¸‡à¹„à¸Ÿ à¹à¸¥à¸°à¸›à¸´à¸”à¹€à¸­à¸Ÿà¹€à¸Ÿà¸à¸•à¹Œà¸—à¸±à¹‰à¸‡à¸«à¸¡à¸”à¹€à¸žà¸·à¹ˆà¸­à¸„à¸§à¸²à¸¡à¸¥à¸·à¹ˆà¸™à¸‚à¸±à¹‰à¸™à¸ªà¸¸à¸”" ;
-[ "Disable3DTitle" ]= "à¸›à¸´à¸”à¹€à¸£à¸™à¹€à¸”à¸­à¸£à¹Œ 3D / à¸ˆà¸­à¸”à¸³ (à¸›à¸£à¸°à¸«à¸¢à¸±à¸” GPU 95%)" ,[ "Disable3DDesc" ]= "à¸«à¸¢à¸¸à¸”à¸›à¸£à¸°à¸¡à¸§à¸¥à¸œà¸¥à¸ à¸²à¸ž 3D à¸¥à¸”à¸ à¸²à¸£à¸°à¸à¸²à¸£à¹Œà¸”à¸ˆà¸­à¹€à¸«à¸¥à¸·à¸­ 1% à¹€à¸«à¸¡à¸²à¸°à¸ªà¸³à¸«à¸£à¸±à¸šà¹€à¸›à¸´à¸”à¸Ÿà¸²à¸£à¹Œà¸¡à¸—à¸´à¹‰à¸‡à¹„à¸§à¹‰à¸‚à¹‰à¸²à¸¡à¸„à¸·à¸™ (à¸«à¸™à¹‰à¸²à¸•à¹ˆà¸²à¸‡ UI à¸¢à¸±à¸‡à¸—à¸³à¸‡à¸²à¸™à¸›à¸à¸•à¸´)" ,[ "LangTitle" ]= "à¸ à¸²à¸©à¸²" ;
-[ "BtnTranslate" ]= "à¹€à¸›à¸¥à¸µà¹ˆà¸¢à¸™à¹€à¸›à¹‡à¸™à¸ à¸²à¸©à¸²à¸­à¸±à¸‡à¸à¸¤à¸©" ;
-[ "DescTranslate" ]= "à¹€à¸›à¸¥à¸µà¹ˆà¸¢à¸™à¸ à¸²à¸©à¸²à¸‚à¸­à¸‡à¸«à¸™à¹‰à¸²à¸•à¹ˆà¸²à¸‡à¸—à¸±à¹‰à¸‡à¸«à¸¡à¸”à¹€à¸›à¹‡à¸™à¸ à¸²à¸©à¸²à¸­à¸±à¸‡à¸à¸¤à¸©" ,[ "SecSystem" ]= "à¸ˆà¸±à¸”à¸à¸²à¸£à¸£à¸°à¸šà¸š" ;
-[ "AntiAFKTitle" ]= "à¸›à¹‰à¸­à¸‡à¸à¸±à¸™ AFK à¹€à¸•à¸° (à¸à¸” Esc 2 à¸—à¸µ / à¸£à¸­à¸‡à¸£à¸±à¸šà¸¡à¸·à¸­à¸–à¸·à¸­)" ;
-[ "AntiAFKDesc" ]= "à¸à¸” Esc à¹€à¸›à¸´à¸”-à¸›à¸´à¸”à¹€à¸¡à¸™à¸¹à¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´à¸—à¸¸à¸ 10 à¸™à¸²à¸—à¸µ + à¸ªà¸±à¸à¸à¸²à¸“ Touch à¸¡à¸·à¸­à¸–à¸·à¸­ à¸£à¸µà¹€à¸‹à¹‡à¸•à¸•à¸±à¸§à¸™à¸±à¸š 20 à¸™à¸²à¸—à¸µ à¸›à¸¥à¸­à¸”à¸ à¸±à¸¢à¹„à¸¡à¹ˆà¹à¸•à¸°à¹€à¸à¸¡" ;
-[ "ResetTitle" ]= "à¸£à¸µà¹€à¸‹à¹‡à¸•à¸ªà¸–à¸²à¸™à¸°à¸•à¸±à¸§à¸¥à¸°à¸„à¸£" ;
-[ "ResetDesc" ]= "à¸¥à¹‰à¸²à¸‡à¸ªà¸–à¸²à¸™à¸°à¸ à¸²à¸¢à¹ƒà¸™à¸—à¸±à¹‰à¸‡à¸«à¸¡à¸”à¹à¸¥à¸°à¸›à¸¥à¸”à¸¥à¹‡à¸­à¸à¸à¸²à¸£à¹€à¸„à¸¥à¸·à¹ˆà¸­à¸™à¸—à¸µà¹ˆà¸—à¸±à¸™à¸—à¸µ" ;
-[ "RejoinTitle" ]= "à¹€à¸‚à¹‰à¸²à¹€à¸‹à¸´à¸£à¹Œà¸Ÿà¹€à¸§à¸­à¸£à¹Œà¹ƒà¸«à¸¡à¹ˆ" ,[ "RejoinDesc" ]= "à¹€à¸Šà¸·à¹ˆà¸­à¸¡à¸•à¹ˆà¸­à¸à¸¥à¸±à¸šà¹€à¸‚à¹‰à¸²à¹€à¸‹à¸´à¸£à¹Œà¸Ÿà¹€à¸§à¸­à¸£à¹Œà¹€à¸”à¸´à¸¡à¹ƒà¸«à¸¡à¹ˆà¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´" ,[ "UnloadTitle" ]= "à¸›à¸´à¸”à¸ªà¸„à¸£à¸´à¸›à¸•à¹Œà¸ªà¸¡à¸šà¸¹à¸£à¸“à¹Œ" ;
-[ "UnloadDesc" ]= "à¸«à¸¢à¸¸à¸”à¸à¸²à¸£à¸—à¸³à¸‡à¸²à¸™à¸‚à¸­à¸‡à¸¥à¸¹à¸›à¸—à¸±à¹‰à¸‡à¸«à¸¡à¸”à¹à¸¥à¸°à¸›à¸´à¸”à¸«à¸™à¹‰à¸²à¸•à¹ˆà¸²à¸‡à¸­à¸¢à¹ˆà¸²à¸‡à¸›à¸¥à¸­à¸”à¸ à¸±à¸¢" };
-[ "Notifications" ]={[ "PlaceStarted" ]= "à¸à¸³à¸¥à¸±à¸‡à¸šà¸´à¸™à¸à¸¥à¸±à¸šà¸šà¹‰à¸²à¸™à¹€à¸žà¸·à¹ˆà¸­à¸™à¸³à¹„à¸‚à¹ˆà¹„à¸›à¸§à¸²à¸‡..." ;
-[ "PlaceDone" ]= "à¸§à¸²à¸‡à¹„à¸‚à¹ˆà¸šà¸™à¹à¸—à¹ˆà¸™à¸Ÿà¸±à¸à¹à¸¥à¸°à¹€à¸£à¸´à¹ˆà¸¡à¸Ÿà¸±à¸à¹€à¸£à¸µà¸¢à¸šà¸£à¹‰à¸­à¸¢!" ;
-[ "AutoPlaceStarted" ]= "à¹€à¸›à¸´à¸”à¹ƒà¸Šà¹‰à¸‡à¸²à¸™ à¸§à¸²à¸‡à¹„à¸‚à¹ˆà¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´ (à¸—à¸¸à¸ 5 à¸Ÿà¸­à¸‡)" ,[ "AutoPlaceStopped" ]= "à¸›à¸´à¸”à¹ƒà¸Šà¹‰à¸‡à¸²à¸™ à¸§à¸²à¸‡à¹„à¸‚à¹ˆà¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´" ,[ "NoEggFound" ]= "à¹„à¸¡à¹ˆà¸žà¸šà¹„à¸‚à¹ˆà¸—à¸µà¹ˆà¸•à¸£à¸‡à¸•à¸²à¸¡à¹€à¸‡à¸·à¹ˆà¸­à¸™à¹„à¸‚à¹ƒà¸™à¸‚à¸“à¸°à¸™à¸µà¹‰" ;
-[ "UnstickDone" ]= "à¸ªà¹ˆà¸‡à¸„à¸³à¸ªà¸±à¹ˆà¸‡à¹à¸à¹‰à¸•à¸±à¸§à¸•à¸´à¸”à¹€à¸£à¸µà¸¢à¸šà¸£à¹‰à¸­à¸¢!" ,[ "TweenStarted" ]= "à¹€à¸›à¸´à¸”à¹ƒà¸Šà¹‰à¸‡à¸²à¸™ à¸‚à¹‚à¸¡à¸¢à¹„à¸‚à¹ˆà¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´ (à¸šà¸´à¸™à¹€à¸£à¹‡à¸§)" ,[ "TweenStopped" ]= "à¸›à¸´à¸”à¹ƒà¸Šà¹‰à¸‡à¸²à¸™ à¸‚à¹‚à¸¡à¸¢à¹„à¸‚à¹ˆà¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´ (à¸šà¸´à¸™à¹€à¸£à¹‡à¸§)" ;
-[ "TeleportStarted" ]= "à¹€à¸›à¸´à¸”à¹ƒà¸Šà¹‰à¸‡à¸²à¸™ à¸‚à¹‚à¸¡à¸¢à¹„à¸‚à¹ˆà¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´ (à¸§à¸²à¸£à¹Œà¸›)" ,[ "TeleportStopped" ]= "à¸›à¸´à¸”à¹ƒà¸Šà¹‰à¸‡à¸²à¸™ à¸‚à¹‚à¸¡à¸¢à¹„à¸‚à¹ˆà¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´ (à¸§à¸²à¸£à¹Œà¸›)" ,[ "HatchStarted" ]= "à¹€à¸›à¸´à¸”à¹ƒà¸Šà¹‰à¸‡à¸²à¸™ à¸Ÿà¸±à¸à¹„à¸‚à¹ˆà¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´" ;
-[ "HatchStopped" ]= "à¸›à¸´à¸”à¹ƒà¸Šà¹‰à¸‡à¸²à¸™ à¸Ÿà¸±à¸à¹„à¸‚à¹ˆà¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´" ,[ "ReturnStarted" ]= "à¹€à¸›à¸´à¸”à¹ƒà¸Šà¹‰à¸‡à¸²à¸™ à¸šà¸´à¸™à¸à¸¥à¸±à¸šà¸žà¸·à¹‰à¸™à¸—à¸µà¹ˆà¸›à¸¥à¸­à¸”à¸ à¸±à¸¢" ,[ "ReturnStopped" ]= "à¸›à¸´à¸”à¹ƒà¸Šà¹‰à¸‡à¸²à¸™ à¸šà¸´à¸™à¸à¸¥à¸±à¸šà¸žà¸·à¹‰à¸™à¸—à¸µà¹ˆà¸›à¸¥à¸­à¸”à¸ à¸±à¸¢" ;
-[ "AutoTreadmillStarted" ]= "à¹€à¸›à¸´à¸”à¹ƒà¸Šà¹‰à¸‡à¸²à¸™ à¸§à¸´à¹ˆà¸‡à¸¥à¸¹à¹ˆà¸§à¸´à¹ˆà¸‡à¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´ (à¸—à¸³à¸‡à¸²à¸™à¹€à¸¡à¸·à¹ˆà¸­à¸§à¹ˆà¸²à¸‡)" ;
-[ "AutoTreadmillStopped" ]= "à¸›à¸´à¸”à¹ƒà¸Šà¹‰à¸‡à¸²à¸™ à¸§à¸´à¹ˆà¸‡à¸¥à¸¹à¹ˆà¸§à¸´à¹ˆà¸‡à¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´" ,[ "UpgradeTreadmillStarted" ]= "à¹€à¸›à¸´à¸”à¹ƒà¸Šà¹‰à¸‡à¸²à¸™ à¸­à¸±à¸›à¹€à¸à¸£à¸”à¸¥à¸¹à¹ˆà¸§à¸´à¹ˆà¸‡à¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´" ,[ "UpgradeTreadmillStopped" ]= "à¸›à¸´à¸”à¹ƒà¸Šà¹‰à¸‡à¸²à¸™ à¸­à¸±à¸›à¹€à¸à¸£à¸”à¸¥à¸¹à¹ˆà¸§à¸´à¹ˆà¸‡à¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´" ;
-[ "BuyTrailsStarted" ]= "à¹€à¸›à¸´à¸”à¹ƒà¸Šà¹‰à¸‡à¸²à¸™ à¸‹à¸·à¹‰à¸­à¹à¸¥à¸°à¹ƒà¸ªà¹ˆ Trail à¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´" ;
-[ "BuyTrailsStopped" ]= "à¸›à¸´à¸”à¹ƒà¸Šà¹‰à¸‡à¸²à¸™ à¸‹à¸·à¹‰à¸­à¹à¸¥à¸°à¹ƒà¸ªà¹ˆ Trail à¸­à¸±à¸•à¹‚à¸™à¸¡à¸±à¸•à¸´" ;
-[ "HideNotEnoughMoneyStarted" ]= "à¹€à¸›à¸´à¸”à¹ƒà¸Šà¹‰à¸‡à¸²à¸™ à¸‹à¹ˆà¸­à¸™à¹à¸ˆà¹‰à¸‡à¹€à¸•à¸·à¸­à¸™à¹€à¸‡à¸´à¸™à¹„à¸¡à¹ˆà¸žà¸­" ,[ "HideNotEnoughMoneyStopped" ]= "à¸›à¸´à¸”à¹ƒà¸Šà¹‰à¸‡à¸²à¸™ à¸‹à¹ˆà¸­à¸™à¹à¸ˆà¹‰à¸‡à¹€à¸•à¸·à¸­à¸™à¹€à¸‡à¸´à¸™à¹„à¸¡à¹ˆà¸žà¸­" ,[ "GodmodeStarted" ]= "à¹€à¸›à¸´à¸”à¹ƒà¸Šà¹‰à¸‡à¸²à¸™ à¹‚à¸«à¸¡à¸”à¸­à¸¡à¸•à¸°" ;
-[ "GodmodeStopped" ]= "à¸›à¸´à¸”à¹ƒà¸Šà¹‰à¸‡à¸²à¸™ à¹‚à¸«à¸¡à¸”à¸­à¸¡à¸•à¸°" ,[ "PerformanceStarted" ]= "à¹€à¸›à¸´à¸”à¹ƒà¸Šà¹‰à¸‡à¸²à¸™ à¹‚à¸«à¸¡à¸”à¸ à¸²à¸žà¸à¸²à¸à¸‚à¸±à¹‰à¸™à¸ªà¸¸à¸” (à¸¥à¸š Texture à¹à¸¥à¸°à¹à¸ªà¸‡à¹€à¸‡à¸²)" ;
-[ "PerformanceStopped" ]= "à¸›à¸´à¸”à¹ƒà¸Šà¹‰à¸‡à¸²à¸™ à¹‚à¸«à¸¡à¸”à¸ à¸²à¸žà¸à¸²à¸à¸‚à¸±à¹‰à¸™à¸ªà¸¸à¸”" ,[ "Disable3DStarted" ]= "à¹€à¸›à¸´à¸”à¹ƒà¸Šà¹‰à¸‡à¸²à¸™ à¹‚à¸«à¸¡à¸”à¸›à¸£à¸°à¸«à¸¢à¸±à¸” GPU (à¸›à¸´à¸”à¹€à¸£à¸™à¹€à¸”à¸­à¸£à¹Œ 3D)" ;
-[ "Disable3DStopped" ]= "à¸„à¸·à¸™à¸„à¹ˆà¸²à¸à¸²à¸£à¹à¸ªà¸”à¸‡à¸œà¸¥ 3D à¸•à¸²à¸¡à¸›à¸à¸•à¸´à¹à¸¥à¹‰à¸§" ;
-[ "AntiAFKStarted" ]= "à¹€à¸›à¸´à¸”à¹ƒà¸Šà¹‰à¸‡à¸²à¸™ à¸›à¹‰à¸­à¸‡à¸à¸±à¸™ AFK (à¸à¸” Esc 2 à¸—à¸µ à¸—à¸¸à¸ 10 à¸™à¸²à¸—à¸µ + à¸£à¸­à¸‡à¸£à¸±à¸šà¸¡à¸·à¸­à¸–à¸·à¸­)" ;
-[ "AntiAFKStopped" ]= "à¸›à¸´à¸”à¹ƒà¸Šà¹‰à¸‡à¸²à¸™ à¸›à¹‰à¸­à¸‡à¸à¸±à¸™ AFK" ;
-[ "LangSwitched" ]= "à¹€à¸›à¸¥à¸µà¹ˆà¸¢à¸™à¸ à¸²à¸©à¸²à¹€à¸›à¹‡à¸™à¸ à¸²à¸©à¸²à¹„à¸—à¸¢à¹€à¸£à¸µà¸¢à¸šà¸£à¹‰à¸­à¸¢à¹à¸¥à¹‰à¸§!" }}}
+[ "Disable3DStarted" ]= "3D Rendering disabled (GPU Saver Active)" ,[ "Disable3DStopped" ]= "3D Rendering restored" ,[ "AntiAFKStarted" ]= "Anti-AFK enabled (Double-Esc 10m & Mobile support)" ,[ "AntiAFKStopped" ]= "Anti-AFK disabled" ,[ "LangSwitched" ]= "Language switched to English successfully!" }},[ "TH" ]={[ "StatusTagReady" ]= "สถานะ: พร้อมทำงาน" ,[ "Tabs" ]={[ "Farm" ]= "ระบบฟาร์ม" ;
+[ "EggSelect" ]= "เลือกประเภทไข่" ,[ "Character" ]= "ตัวละคร" ;
+[ "Settings" ]= "ตั้งค่า" },[ "EggSelect" ]={[ "SecZones" ]= "เลือกโซนเป้าหมาย" ,[ "SecZonesDesc" ]= "เลือกโซนที่ต้องการไปขโมยไข่ (ไข่ระดับ Secret ขึ้นไปจะไม่สนโซน)" ,[ "DropZonesTitle" ]= "โซนเป้าหมายที่เลือก" ,[ "DropZonesDesc" ]= "คลิกเพื่อเลือกโซนที่ต้องการขโมยไข่" ,[ "SecRarities" ]= "เลือกระดับความหายาก" ,[ "SecRaritiesDesc" ]= "เลือกระดับความหายากของไข่ที่ต้องการขโมย" ,[ "DropRaritiesTitle" ]= "ระดับความหายากที่เลือก" ;
+[ "DropRaritiesDesc" ]= "คลิกเพื่อเลือกระดับความหายากที่ต้องการขโมย" ;
+[ "AlwaysSecretPlus" ]= "เก็บไข่ Secret+ ทุกโซนเสมอ" ;
+[ "AlwaysSecretPlusDesc" ]= "ขโมยไข่ระดับ Secret, Eternal, Divine ทันทีไม่ว่าจะเกิดที่โซนใด" };
+[ "Farm" ]={[ "SecModes" ]= "โหมดขโมยไข่อัตโนมัติ" ,[ "TweenTitle" ]= "ขโมยไข่อัตโนมัติ (บินเร็ว)" ,[ "TweenDesc" ]= "บินไปขโมยไข่และเก็บใส่กระเป๋าอย่างต่อเนื่องตามทางด่วนความเร็วสูง" ,[ "TeleportTitle" ]= "ขโมยไข่อัตโนมัติ (วาร์ป)" ;
+[ "TeleportDesc" ]= "วาร์ปไปขโมยไข่อย่างรวดเร็วและต่อเนื่อง" ,[ "SingleTitle" ]= "ขโมยไข่ใบเดียว" ,[ "SingleDesc" ]= "วาร์ปไปขโมยไข่เป้าหมาย 1 ใบแล้วกลับมาที่ฐานทันที" ;
+[ "SecPlace" ]= "นำส่งและฟักไข่" ;
+[ "PlaceTitle" ]= "วางไข่ในรัง" ;
+[ "PlaceDesc" ]= "บินกลับบ้านและนำไข่ในตัวไปวางบนแท่นฟักที่ว่างแล้วเริ่มฟักทันที" ,[ "AutoPlaceTitle" ]= "วางไข่อัตโนมัติ (ทุก 5 ฟอง)" ,[ "AutoPlaceDesc" ]= "กลับบ้านทุกครั้งที่ขโมยครบ 5 ฟองเพื่อนำไข่ไปวาง" ;
+[ "HatchTitle" ]= "ฟักไข่อัตโนมัติ" ,[ "HatchDesc" ]= "สั่งฟักไข่ที่พร้อมฟักอย่างต่อเนื่องจากทุกที่" ;
+[ "ReturnTitle" ]= "บินกลับพื้นที่ปลอดภัย" ,[ "ReturnDesc" ]= "บินกลับเข้าพื้นที่ปลอดภัยอัตโนมัติหลังขโมยไข่เสร็จ" ;
+[ "AutoTreadmillTitle" ]= "วิ่งลู่วิ่งอัตโนมัติ" ;
+[ "AutoTreadmillDesc" ]= "ไปวิ่งบนลู่วิ่งที่บ้านอัตโนมัติเมื่อไม่มีไข่ตามที่เลือกเกิด" ;
+[ "UpgradeTreadmillTitle" ]= "อัปเกรดลู่วิ่งอัตโนมัติ" ;
+[ "UpgradeTreadmillDesc" ]= "อัปเกรดระดับลู่วิ่งที่บ้านอัตโนมัติทันทีที่มีเงินพอ" ;
+[ "BuyTrailsTitle" ]= "ซื้อและใส่ Trail อัตโนมัติ" ,[ "BuyTrailsDesc" ]= "ซื้อเส้นทางเพิ่มความเร็วและสวมใส่อันที่ดีที่สุดอัตโนมัติเมื่อเงินพอ" ;
+[ "HideNotEnoughMoneyTitle" ]= "ซ่อนแจ้งเตือนเงินไม่พอ" ;
+[ "HideNotEnoughMoneyDesc" ]= "บล็อกและซ่อนข้อความสีแดง 'Not enough money' จากตัวเกมอัตโนมัติ" };
+[ "Character" ]={[ "SecSafety" ]= "ความปลอดภัยและตัวละคร" ;
+[ "GodmodeTitle" ]= "โหมดอมตะ" ;
+[ "GodmodeDesc" ]= "ป้องกันดาเมจจากสิ่งกีดขวางและกับดัก 100%" ;
+[ "UnstickTitle" ]= "แก้ตัวติด / ลงจากลู่วิ่ง" ,[ "UnstickDesc" ]= "หลุดออกจากสิ่งกีดขวางหรืออุปกรณ์ทันที" ,[ "SecFlight" ]= "การตั้งค่าการบิน" ,[ "SpeedTitle" ]= "ความเร็วการบิน" ;
+[ "SpeedDesc" ]= "ปรับความเร็วในการบิน (Studs/วินาที)" };
+[ "Settings" ]={[ "SecDashboard" ]= "แดชบอร์ดสถานะสด" ;
+[ "DashTitle" ]= "แดชบอร์ดสถานะสด" ;
+[ "DashDesc" ]= "สถานะ: %s\nโหมดฟาร์ม: %s\nจำนวนไข่ในตัว: %d ฟอง\nความเร็วการบิน: %d Studs/วิ" ;
+[ "SecBlacklist" ]= "ตัวเลือกโซนที่ต้องการ" ;
+[ "BlacklistToggleTitle" ]= "ขโมยในโซน: %s" ,[ "BlacklistToggleDesc" ]= "เปิด/ปิด การขโมยไข่ทั่วไปในโซน %s (ระดับ Secret+ จะเก็บเสมอ)" ;
+[ "SecUI" ]= "ปรับแต่งหน้าต่าง" ;
+[ "TranspTitle" ]= "ความโปร่งใสของหน้าต่าง" ,[ "TranspDesc" ]= "ปรับความโปร่งแสงของพื้นหลังหน้าต่าง (0% - 90%)" ;
+[ "ThemeTitle" ]= "เลือกธีมหน้าต่าง" ;
+[ "SecPerformance" ]= "ประสิทธิภาพและกราฟิก" ;
+[ "PerformanceTitle" ]= "โหมดภาพกากขั้นสุด (Ultra Potato Mode)" ;
+[ "PerformanceDesc" ]= "ลดกราฟิก ลบ Texture ของโมเดล ปิดเงา ปิดแสงไฟ และปิดเอฟเฟกต์ทั้งหมดเพื่อความลื่นขั้นสุด" ;
+[ "Disable3DTitle" ]= "ปิดเรนเดอร์ 3D / จอดำ (ประหยัด GPU 95%)" ,[ "Disable3DDesc" ]= "หยุดประมวลผลภาพ 3D ลดภาระการ์ดจอเหลือ 1% เหมาะสำหรับเปิดฟาร์มทิ้งไว้ข้ามคืน (หน้าต่าง UI ยังทำงานปกติ)" ,[ "LangTitle" ]= "ภาษา" ;
+[ "BtnTranslate" ]= "เปลี่ยนเป็นภาษาอังกฤษ" ;
+[ "DescTranslate" ]= "เปลี่ยนภาษาของหน้าต่างทั้งหมดเป็นภาษาอังกฤษ" ,[ "SecSystem" ]= "จัดการระบบ" ;
+[ "AntiAFKTitle" ]= "ป้องกัน AFK เตะ (กด Esc 2 ที / รองรับมือถือ)" ;
+[ "AntiAFKDesc" ]= "กด Esc เปิด-ปิดเมนูอัตโนมัติทุก 10 นาที + สัญญาณ Touch มือถือ รีเซ็ตตัวนับ 20 นาที ปลอดภัยไม่แตะเกม" ;
+[ "ResetTitle" ]= "รีเซ็ตสถานะตัวละคร" ;
+[ "ResetDesc" ]= "ล้างสถานะภายในทั้งหมดและปลดล็อกการเคลื่อนที่ทันที" ;
+[ "RejoinTitle" ]= "เข้าเซิร์ฟเวอร์ใหม่" ,[ "RejoinDesc" ]= "เชื่อมต่อกลับเข้าเซิร์ฟเวอร์เดิมใหม่อัตโนมัติ" ,[ "UnloadTitle" ]= "ปิดสคริปต์สมบูรณ์" ;
+[ "UnloadDesc" ]= "หยุดการทำงานของลูปทั้งหมดและปิดหน้าต่างอย่างปลอดภัย" };
+[ "Notifications" ]={[ "PlaceStarted" ]= "กำลังบินกลับบ้านเพื่อนำไข่ไปวาง..." ;
+[ "PlaceDone" ]= "วางไข่บนแท่นฟักและเริ่มฟักเรียบร้อย!" ;
+[ "AutoPlaceStarted" ]= "เปิดใช้งาน วางไข่อัตโนมัติ (ทุก 5 ฟอง)" ,[ "AutoPlaceStopped" ]= "ปิดใช้งาน วางไข่อัตโนมัติ" ,[ "NoEggFound" ]= "ไม่พบไข่ที่ตรงตามเงื่อนไขในขณะนี้" ;
+[ "UnstickDone" ]= "ส่งคำสั่งแก้ตัวติดเรียบร้อย!" ,[ "TweenStarted" ]= "เปิดใช้งาน ขโมยไข่อัตโนมัติ (บินเร็ว)" ,[ "TweenStopped" ]= "ปิดใช้งาน ขโมยไข่อัตโนมัติ (บินเร็ว)" ;
+[ "TeleportStarted" ]= "เปิดใช้งาน ขโมยไข่อัตโนมัติ (วาร์ป)" ,[ "TeleportStopped" ]= "ปิดใช้งาน ขโมยไข่อัตโนมัติ (วาร์ป)" ,[ "HatchStarted" ]= "เปิดใช้งาน ฟักไข่อัตโนมัติ" ;
+[ "HatchStopped" ]= "ปิดใช้งาน ฟักไข่อัตโนมัติ" ,[ "ReturnStarted" ]= "เปิดใช้งาน บินกลับพื้นที่ปลอดภัย" ,[ "ReturnStopped" ]= "ปิดใช้งาน บินกลับพื้นที่ปลอดภัย" ;
+[ "AutoTreadmillStarted" ]= "เปิดใช้งาน วิ่งลู่วิ่งอัตโนมัติ (ทำงานเมื่อว่าง)" ;
+[ "AutoTreadmillStopped" ]= "ปิดใช้งาน วิ่งลู่วิ่งอัตโนมัติ" ,[ "UpgradeTreadmillStarted" ]= "เปิดใช้งาน อัปเกรดลู่วิ่งอัตโนมัติ" ,[ "UpgradeTreadmillStopped" ]= "ปิดใช้งาน อัปเกรดลู่วิ่งอัตโนมัติ" ;
+[ "BuyTrailsStarted" ]= "เปิดใช้งาน ซื้อและใส่ Trail อัตโนมัติ" ;
+[ "BuyTrailsStopped" ]= "ปิดใช้งาน ซื้อและใส่ Trail อัตโนมัติ" ;
+[ "HideNotEnoughMoneyStarted" ]= "เปิดใช้งาน ซ่อนแจ้งเตือนเงินไม่พอ" ,[ "HideNotEnoughMoneyStopped" ]= "ปิดใช้งาน ซ่อนแจ้งเตือนเงินไม่พอ" ,[ "GodmodeStarted" ]= "เปิดใช้งาน โหมดอมตะ" ;
+[ "GodmodeStopped" ]= "ปิดใช้งาน โหมดอมตะ" ,[ "PerformanceStarted" ]= "เปิดใช้งาน โหมดภาพกากขั้นสุด (ลบ Texture และแสงเงา)" ;
+[ "PerformanceStopped" ]= "ปิดใช้งาน โหมดภาพกากขั้นสุด" ,[ "Disable3DStarted" ]= "เปิดใช้งาน โหมดประหยัด GPU (ปิดเรนเดอร์ 3D)" ;
+[ "Disable3DStopped" ]= "คืนค่าการแสดงผล 3D ตามปกติแล้ว" ;
+[ "AntiAFKStarted" ]= "เปิดใช้งาน ป้องกัน AFK (กด Esc 2 ที ทุก 10 นาที + รองรับมือถือ)" ;
+[ "AntiAFKStopped" ]= "ปิดใช้งาน ป้องกัน AFK" ;
+[ "LangSwitched" ]= "เปลี่ยนภาษาเป็นภาษาไทยเรียบร้อยแล้ว!" }}}
 local Fk={}
 local hk,Ok,Yk,Tk
 local xk={ "Farm" ;
@@ -4082,23 +4276,23 @@ local xk={ "Farm" ;
 local function Wk(e,...)
     local r=(e== "TH" )
     if h.delivering then
-        return r and "à¸à¸³à¸¥à¸±à¸‡à¸§à¸²à¸‡à¹„à¸‚à¹ˆ" or "Placing Egg"
+        return r and "กำลังวางไข่" or "Placing Egg"
     elseif h.securingEgg or h.holdingEggForGuard then
-        return r and "à¸à¸³à¸¥à¸±à¸‡à¸«à¸¢à¸´à¸šà¹„à¸‚à¹ˆ" or "Securing Egg"
+        return r and "กำลังหยิบไข่" or "Securing Egg"
     elseif h.teleporting then
-        return r and "à¸à¸³à¸¥à¸±à¸‡à¸§à¸²à¸£à¹Œà¸›" or "Teleporting"
+        return r and "กำลังวาร์ป" or "Teleporting"
     elseif h.isReturning then
-        return r and "à¸à¸³à¸¥à¸±à¸‡à¸šà¸´à¸™à¸à¸¥à¸±à¸š" or "Returning"
+        return r and "กำลังบินกลับ" or "Returning"
     elseif h.glidingToTarget then
-        return r and "à¸à¸³à¸¥à¸±à¸‡à¸šà¸´à¸™à¹„à¸›à¸‚à¹‚à¸¡à¸¢" or "Stealing"
+        return r and "กำลังบินไปขโมย" or "Stealing"
     elseif h.onTreadmill or(L4 and L4())then
-        return r and "à¸­à¸¢à¸¹à¹ˆà¸šà¸™à¸¥à¸¹à¹ˆà¸§à¸´à¹ˆà¸‡" or "On Treadmill"
+        return r and "อยู่บนลู่วิ่ง" or "On Treadmill"
     elseif Y4== "TWEEN" and not h.isReturning then
-        return r and "à¸à¸³à¸¥à¸±à¸‡à¸«à¸²à¹„à¸‚à¹ˆ" or "Searching"
+        return r and "กำลังหาไข่" or "Searching"
     elseif Y4== "WARP" and not h.isReturning then
-        return r and "à¸à¸³à¸¥à¸±à¸‡à¸«à¸²à¹„à¸‚à¹ˆ" or "Searching"
+        return r and "กำลังหาไข่" or "Searching"
     else
-        return r and "à¸žà¸£à¹‰à¸­à¸¡à¸—à¸³à¸‡à¸²à¸™" or "Ready"
+        return r and "พร้อมทำงาน" or "Ready"
     end
 end
 local function mk(e,...) pcall(function(...)
@@ -4165,7 +4359,7 @@ local function rM(e,r,y,...) pcall(function(...)
             if e then
                 e:Destroy()
             end
-            local j=u:FindFirstChild( "NYXEONAccentStroke" )or u:FindFirstChildOfClass( "UIStroke" )
+            local j=u:FindFirstChild( "LunarisAccentStroke" )or u:FindFirstChildOfClass( "UIStroke" )
             if j then
                 j:Destroy()
             end
@@ -4262,7 +4456,7 @@ local function wM(e,...)
     eM(Fk.secSafety ,r.Character.SecSafety )eM(Fk.togGodmode ,r.Character.GodmodeTitle ,r.Character.GodmodeDesc )eM(Fk.btnUnstick ,r.Character.UnstickTitle ,r.Character.UnstickDesc )eM(Fk.secFlight ,r.Character.SecFlight )eM(Fk.sliderSpeed ,r.Character.SpeedTitle ,r.Character.SpeedDesc )eM(Fk.secDashboard ,r.Settings.SecDashboard )eM(Fk.paraLiveDash ,r.Settings.DashTitle )eM(Fk.secBlacklist ,r.Settings.SecBlacklist )eM(Fk.secUI ,r.Settings.SecUI )eM(Fk.dropLang ,r.Settings.LangTitle )eM(Fk.sliderTransp ,r.Settings.TranspTitle ,r.Settings.TranspDesc )eM(Fk.dropTheme ,r.Settings.ThemeTitle )eM(Fk.secPerformance ,r.Settings.SecPerformance )eM(Fk.togPerformance ,r.Settings.PerformanceTitle ,r.Settings.PerformanceDesc )eM(Fk.togDisable3D ,r.Settings.Disable3DTitle ,r.Settings.Disable3DDesc )eM(Fk.secSystem ,r.Settings.SecSystem )eM(Fk.togAntiAFK ,r.Settings.AntiAFKTitle ,r.Settings.AntiAFKDesc )eM(Fk.btnReset ,r.Settings.ResetTitle ,r.Settings.ResetDesc )eM(Fk.btnRejoin ,r.Settings.RejoinTitle ,r.Settings.RejoinDesc )eM(Fk.btnUnload ,r.Settings.UnloadTitle ,r.Settings.UnloadDesc )yM()
 end
 local function jM(...)
-    local e=Instance.new ( "ScreenGui" )e.Name = "NYXEON_LOADER_SCREEN" e.ResetOnSpawn = false e.DisplayOrder = 9999999 e.ZIndexBehavior =Enum.ZIndexBehavior.Sibling e.AutoLocalize = false pcall(function(...)
+    local e=Instance.new ( "ScreenGui" )e.Name = "Lunaris_LOADER_SCREEN" e.ResetOnSpawn = false e.DisplayOrder = 9999999 e.ZIndexBehavior =Enum.ZIndexBehavior.Sibling e.AutoLocalize = false pcall(function(...)
         if syn and syn.protect_gui then
             syn.protect_gui (e)e.Parent =game:GetService( "CoreGui" )
         else
@@ -4276,7 +4470,7 @@ local function jM(...)
     local r=Instance.new ( "Frame" )r.Name = "Card" r.Size =UDim2.fromOffset ( 336 , 140 )r.Position =UDim2.new ( 0.5 , -168 , 0.5 , -70 )r.BackgroundColor3 =Color3.fromRGB ( 16 , 16 , 22 )r.BorderSizePixel = 0 r.Parent =e;
     (Instance.new ( "UICorner" ,r)).CornerRadius =UDim.new ( 0 , 14 )
     local y=Instance.new ( "UIStroke" ,r)y.Color =Color3.fromRGB ( 0 , 185 , 255 )y.Thickness = 1.4 y.ApplyStrokeMode =Enum.ApplyStrokeMode.Border
-    local w=Instance.new ( "TextLabel" )w.Size =UDim2.new ( 1 , -28 , 0 , 24 )w.Position =UDim2.new ( 0 , 14 , 0 , 14 )w.BackgroundTransparency = 1 w.Text = "NYXEON Hub" w.TextColor3 =Color3.fromRGB ( 245 , 248 , 255 )w.TextSize = 18 w.Font =Enum.Font.GothamBold w.TextXAlignment =Enum.TextXAlignment.Left w.AutoLocalize = false w.Parent =r
+    local w=Instance.new ( "TextLabel" )w.Size =UDim2.new ( 1 , -28 , 0 , 24 )w.Position =UDim2.new ( 0 , 14 , 0 , 14 )w.BackgroundTransparency = 1 w.Text = "Lunaris Hub" w.TextColor3 =Color3.fromRGB ( 245 , 248 , 255 )w.TextSize = 18 w.Font =Enum.Font.GothamBold w.TextXAlignment =Enum.TextXAlignment.Left w.AutoLocalize = false w.Parent =r
     local j=Instance.new ( "TextLabel" )j.Size =UDim2.new ( 1 , -28 , 0 , 16 )j.Position =UDim2.new ( 0 , 14 , 0 , 38 )j.BackgroundTransparency = 1 j.Text = "Steal an Egg Suite v42.64" j.TextColor3 =Color3.fromRGB ( 140 , 150 , 175 )j.TextSize = 12 j.Font =Enum.Font.Gotham j.TextXAlignment =Enum.TextXAlignment.Left j.AutoLocalize = false j.Parent =r
     local k=Instance.new ( "TextLabel" )k.Size =UDim2.new ( 0 , 50 , 0 , 24 )k.Position =UDim2.new ( 1 , -64 , 0 , 14 )k.BackgroundTransparency = 1 k.Text = "0%" k.TextColor3 =Color3.fromRGB ( 0 , 255 , 160 )k.TextSize = 14 k.Font =Enum.Font.GothamBold k.TextXAlignment =Enum.TextXAlignment.Right k.AutoLocalize = false k.Parent =r
     local a=Instance.new ( "Frame" )a.Size =UDim2.new ( 1 , -28 , 0 , 10 )a.Position =UDim2.new ( 0 , 14 , 0 , 74 )a.BackgroundColor3 =Color3.fromRGB ( 25 , 27 , 38 )a.BorderSizePixel = 0 a.Parent =r;
@@ -4284,7 +4478,7 @@ local function jM(...)
     local V=Instance.new ( "Frame" )V.Size =UDim2.new ( 0 , 0 , 1 , 0 )V.BackgroundColor3 =Color3.fromRGB ( 0 , 185 , 255 )V.BorderSizePixel = 0 V.Parent =a;
     (Instance.new ( "UICorner" ,V)).CornerRadius =UDim.new ( 0 , 5 )
     local H=Instance.new ( "UIGradient" ,V)H.Color =ColorSequence.new ({ColorSequenceKeypoint.new ( 0 ,Color3.fromRGB ( 0 , 185 , 255 )),ColorSequenceKeypoint.new ( 1 ,Color3.fromRGB ( 0 , 255 , 160 ))})
-    local t=Instance.new ( "TextLabel" )t.Size =UDim2.new ( 1 , -28 , 0 , 16 )t.Position =UDim2.new ( 0 , 14 , 0 , 94 )t.BackgroundTransparency = 1 t.Text = "Initializing NYXEON Hub..." t.TextColor3 =Color3.fromRGB ( 130 , 140 , 165 )t.TextSize = 11 t.Font =Enum.Font.Gotham t.TextXAlignment =Enum.TextXAlignment.Left t.AutoLocalize = false t.Parent =r task.spawn (function(...)
+    local t=Instance.new ( "TextLabel" )t.Size =UDim2.new ( 1 , -28 , 0 , 16 )t.Position =UDim2.new ( 0 , 14 , 0 , 94 )t.BackgroundTransparency = 1 t.Text = "Initializing Lunaris Hub..." t.TextColor3 =Color3.fromRGB ( 130 , 140 , 165 )t.TextSize = 11 t.Font =Enum.Font.Gotham t.TextXAlignment =Enum.TextXAlignment.Left t.AutoLocalize = false t.Parent =r task.spawn (function(...)
         for y= 1 , 100 , 1 do
             if not e.Parent then
                 break
@@ -4323,7 +4517,7 @@ local function jM(...)
     end
     return s
 end
-local kM={}kM.Gui =Instance.new ( "ScreenGui" )kM.Gui.Name = "NYXEON_RESTORE_BAR" kM.Gui.ResetOnSpawn = false kM.Gui.DisplayOrder = 999999 kM.Gui.ZIndexBehavior =Enum.ZIndexBehavior.Sibling kM.Gui.AutoLocalize = false pcall(function(...)
+local kM={}kM.Gui =Instance.new ( "ScreenGui" )kM.Gui.Name = "Lunaris_RESTORE_BAR" kM.Gui.ResetOnSpawn = false kM.Gui.DisplayOrder = 999999 kM.Gui.ZIndexBehavior =Enum.ZIndexBehavior.Sibling kM.Gui.AutoLocalize = false pcall(function(...)
     if syn and syn.protect_gui then
         syn.protect_gui (kM.Gui )kM.Gui.Parent =game:GetService( "CoreGui" )
     else
@@ -4334,7 +4528,7 @@ end
 if not kM.Gui.Parent then
     kM.Gui.Parent =game:GetService( "CoreGui" )
 end
-kM.Btn =Instance.new ( "ImageButton" )kM.Btn.Name = "NYXEON_SquareLogoButton" kM.Btn.Size =UDim2.fromOffset ( 46 , 46 )kM.Btn.Position =UDim2.new ( 0 , 20 , 0 , 20 )kM.Btn.BackgroundColor3 =Color3.fromRGB ( 18 , 18 , 24 )kM.Btn.Active = true kM.Btn.Selectable = true kM.Btn.Visible = false kM.Btn.ZIndex = 999999 kM.Btn.AutoLocalize = false kM.Btn.Parent =kM.Gui ;
+kM.Btn =Instance.new ( "ImageButton" )kM.Btn.Name = "Lunaris_SquareLogoButton" kM.Btn.Size =UDim2.fromOffset ( 46 , 46 )kM.Btn.Position =UDim2.new ( 0 , 20 , 0 , 20 )kM.Btn.BackgroundColor3 =Color3.fromRGB ( 18 , 18 , 24 )kM.Btn.Active = true kM.Btn.Selectable = true kM.Btn.Visible = false kM.Btn.ZIndex = 999999 kM.Btn.AutoLocalize = false kM.Btn.Parent =kM.Gui ;
 (Instance.new ( "UICorner" ,kM.Btn )).CornerRadius =UDim.new ( 0 , 10 )kM.Stroke =Instance.new ( "UIStroke" ,kM.Btn )kM.Stroke.Color =Color3.fromRGB ( 0 , 185 , 255 )kM.Stroke.Thickness = 1.6 kM.Stroke.ApplyStrokeMode =Enum.ApplyStrokeMode.Border kM.Logo =Instance.new ( "ImageLabel" ,kM.Btn )kM.Logo.Name = "LogoIcon" kM.Logo.Size =UDim2.fromOffset ( 36 , 36 )kM.Logo.Position =UDim2.new ( 0.5 , 0 , 0.5 , 0 )kM.Logo.AnchorPoint =Vector2.new ( 0.5 , 0.5 )kM.Logo.BackgroundTransparency = 1 kM.Logo.Image =dk kM.Logo.ImageColor3 =Color3.fromRGB ( 255 , 255 , 255 )kM.Logo.ZIndex = 1000000 ;
 (Instance.new ( "UICorner" ,kM.Logo )).CornerRadius =UDim.new ( 0 , 8 )kM.isDragging = false kM.dragStart =nil kM.startPos =nil kM.Btn.InputBegan :Connect(function(e,...)
     if e.UserInputType ==Enum.UserInputType.MouseButton1 or e.UserInputType ==Enum.UserInputType.Touch then
@@ -4355,7 +4549,7 @@ end
 local function aM(...) h.alive = false pcall(Ik)pcall(Ak)pcall(function(...) y:Set3dRenderingEnabled( true )
     end
     )pcall(function(...)
-        local y=r:FindFirstChild( "NYXEONHub_EggESP" )
+        local y=r:FindFirstChild( "LunarisHub_EggESP" )
         if y then
             y:Destroy()
         end
@@ -4373,7 +4567,7 @@ local function aM(...) h.alive = false pcall(Ik)pcall(Ak)pcall(function(...) y:S
     end
     pcall(function(...)
         for r,y in ipairs(game.CoreGui :GetChildren())do
-            if y.Name :find( "NYXEON_" )or y.Name :find( "DesyncSniperUI" )or y.Name :find( "WindUI" )then
+            if y.Name :find( "Lunaris_" )or y.Name :find( "DesyncSniperUI" )or y.Name :find( "WindUI" )then
                 y:Destroy()
             end
         end
@@ -4397,7 +4591,7 @@ local function oM(...)
         end
         if not y then
             pcall(function(...)
-                (game:GetService( "StarterGui" )):SetCore( "SendNotification" ,{[ "Title" ]=tostring(e.Title or "NYXEON Hub" ),[ "Text" ]=tostring(e.Content or "" );
+                (game:GetService( "StarterGui" )):SetCore( "SendNotification" ,{[ "Title" ]=tostring(e.Title or "Lunaris Hub" ),[ "Text" ]=tostring(e.Content or "" );
                 [ "Duration" ]= 3 })
             end
             )
@@ -4413,7 +4607,7 @@ local function oM(...)
                     )
                     if not u then
                         pcall(function(...)
-                            (game:GetService( "StarterGui" )):SetCore( "SendNotification" ,{[ "Title" ]=tostring(y and y.Title or "NYXEON Hub" );
+                            (game:GetService( "StarterGui" )):SetCore( "SendNotification" ,{[ "Title" ]=tostring(y and y.Title or "Lunaris Hub" );
                             [ "Text" ]=tostring(y and y.Content or "" ),[ "Duration" ]= 3 })
                         end
                         )
@@ -4428,9 +4622,9 @@ local function oM(...)
         local H=V and math.clamp (a.X * 0.7 , 440 , 500 )or 500
         local t=V and math.clamp (a.Y * 0.72 , 280 , 340 )or 340
         local s=UDim2.fromOffset (H,t)
-        local p=r:CreateWindow({[ "Title" ]= "NYXEON ST CHEAT" ;
+        local p=r:CreateWindow({[ "Title" ]= "Lunaris ST CHEAT" ;
         [ "Author" ]= "Steal An Egg V1" ;
-        [ "Folder" ]= "NYXEON_StealAnEgg" ;
+        [ "Folder" ]= "Lunaris_StealAnEgg" ;
         [ "Icon" ]=dk;
         [ "Theme" ]= "Dark" ,[ "IconSize" ]= 28 ,[ "Size" ]=s,[ "MinSize" ]=Vector2.new ( 400 , 240 );
         [ "MaxSize" ]=Vector2.new ( 900 , 600 ),[ "Resizable" ]= true ,[ "SideBarWidth" ]=V and 140 or 160 ,[ "ToggleKey" ]=Enum.KeyCode.RightShift ;
@@ -4684,37 +4878,37 @@ local function oM(...)
         [ "Desc" ]=P.Farm.UpgradeTreadmillDesc or "Automatically upgrade base treadmill tier when you have enough cash" ;
         [ "Icon" ]= "solar:double-alt-arrow-up-bold" ;
         [ "Value" ]=h.autoUpgradeTreadmill ,[ "Callback" ]=function(e,...) h.autoUpgradeTreadmill =e x()
-            local r=Gk[Xk]or Gk.EN j({[ "Title" ]=(Xk== "TH" )and "à¸­à¸±à¸›à¹€à¸à¸£à¸”à¸¥à¸¹à¹ˆà¸§à¸´à¹ˆà¸‡" or "Upgrade Treadmill" ,[ "Content" ]=e and((r.Notifications.UpgradeTreadmillStarted or "Auto Upgrade Treadmill enabled" ))or(r.Notifications.UpgradeTreadmillStopped or "Auto Upgrade Treadmill disabled" ),[ "Icon" ]=e and "check-circle" or "x-circle" })
+            local r=Gk[Xk]or Gk.EN j({[ "Title" ]=(Xk== "TH" )and "อัปเกรดลู่วิ่ง" or "Upgrade Treadmill" ,[ "Content" ]=e and((r.Notifications.UpgradeTreadmillStarted or "Auto Upgrade Treadmill enabled" ))or(r.Notifications.UpgradeTreadmillStopped or "Auto Upgrade Treadmill disabled" ),[ "Icon" ]=e and "check-circle" or "x-circle" })
         end
         })Fk.togAutoBuyTrails =hk:Toggle({[ "Title" ]=P.Farm.BuyTrailsTitle or "Auto Buy & Equip Trails" ;
         [ "Desc" ]=P.Farm.BuyTrailsDesc or "Automatically purchase and equip the best speed trail available" ;
         [ "Icon" ]= "solar:fire-bold" ;
         [ "Value" ]=h.autoBuyTrails ;
         [ "Callback" ]=function(e,...) h.autoBuyTrails =e x()
-            local r=Gk[Xk]or Gk.EN j({[ "Title" ]=(Xk== "TH" )and "à¸‹à¸·à¹‰à¸­ Trail" or "Buy Trails" ,[ "Content" ]=e and((r.Notifications.BuyTrailsStarted or "Auto Buy Trails enabled" ))or(r.Notifications.BuyTrailsStopped or "Auto Buy Trails disabled" );
+            local r=Gk[Xk]or Gk.EN j({[ "Title" ]=(Xk== "TH" )and "ซื้อ Trail" or "Buy Trails" ,[ "Content" ]=e and((r.Notifications.BuyTrailsStarted or "Auto Buy Trails enabled" ))or(r.Notifications.BuyTrailsStopped or "Auto Buy Trails disabled" );
             [ "Icon" ]=e and "check-circle" or "x-circle" })
         end
         })Fk.secEggZones =Ok:Section({[ "Title" ]=(P.EggSelect and P.EggSelect.SecZones )or "Target Zones" })
-        local D={ "ðŸŸ£ Light Dark" ;
-        "ðŸŸ¡ Titan Temple" , "ðŸŒ¸ Cherry Blossom" ;
-        "ðŸŒŒ Cosmic" ;
-        "ðŸ¦– Prehistoric" , "ðŸŒŠ Abyss Ocean" , "ðŸŒ‹ Volcano" ;
-        "â„ï¸ Snow" ;
-        "ðŸŒ´ Jungle" ;
-        "ðŸœï¸ Desert" , "ðŸ’§ Lake" ;
-        "ðŸŒ² Forest" }
-        local C={[ "ðŸŸ£ Light Dark" ]= "Light Dark" ,[ "ðŸŸ¡ Titan Temple" ]= "Titan Temple" ,[ "ðŸŒ¸ Cherry Blossom" ]= "Cherry Blossom" ,[ "ðŸŒŒ Cosmic" ]= "Cosmic" ;
-        [ "ðŸ¦– Prehistoric" ]= "Prehistoric" ,[ "ðŸŒŠ Abyss Ocean" ]= "Abyss Ocean" ;
-        [ "ðŸŒ‹ Volcano" ]= "Volcano" ;
-        [ "â„ï¸ Snow" ]= "Snow" ;
-        [ "ðŸŒ´ Jungle" ]= "Jungle" ,[ "ðŸœï¸ Desert" ]= "Desert" ,[ "ðŸ’§ Lake" ]= "Lake" ,[ "ðŸŒ² Forest" ]= "Forest" }
-        local q={[ "Light Dark" ]= "ðŸŸ£ Light Dark" ,[ "Titan Temple" ]= "ðŸŸ¡ Titan Temple" ;
-        [ "Cherry Blossom" ]= "ðŸŒ¸ Cherry Blossom" ;
-        [ "Cosmic" ]= "ðŸŒŒ Cosmic" ,[ "Prehistoric" ]= "ðŸ¦– Prehistoric" ;
-        [ "Abyss Ocean" ]= "ðŸŒŠ Abyss Ocean" ;
-        [ "Volcano" ]= "ðŸŒ‹ Volcano" ;
-        [ "Snow" ]= "â„ï¸ Snow" ,[ "Jungle" ]= "ðŸŒ´ Jungle" ,[ "Desert" ]= "ðŸœï¸ Desert" ;
-        [ "Lake" ]= "ðŸ’§ Lake" ,[ "Forest" ]= "ðŸŒ² Forest" }
+        local D={ "🟣 Light Dark" ;
+        "🟡 Titan Temple" , "🌸 Cherry Blossom" ;
+        "🌌 Cosmic" ;
+        "🦖 Prehistoric" , "🌊 Abyss Ocean" , "🌋 Volcano" ;
+        "❄️ Snow" ;
+        "🌴 Jungle" ;
+        "🏜️ Desert" , "💧 Lake" ;
+        "🌲 Forest" }
+        local C={[ "🟣 Light Dark" ]= "Light Dark" ,[ "🟡 Titan Temple" ]= "Titan Temple" ,[ "🌸 Cherry Blossom" ]= "Cherry Blossom" ,[ "🌌 Cosmic" ]= "Cosmic" ;
+        [ "🦖 Prehistoric" ]= "Prehistoric" ,[ "🌊 Abyss Ocean" ]= "Abyss Ocean" ;
+        [ "🌋 Volcano" ]= "Volcano" ;
+        [ "❄️ Snow" ]= "Snow" ;
+        [ "🌴 Jungle" ]= "Jungle" ,[ "🏜️ Desert" ]= "Desert" ,[ "💧 Lake" ]= "Lake" ,[ "🌲 Forest" ]= "Forest" }
+        local q={[ "Light Dark" ]= "🟣 Light Dark" ,[ "Titan Temple" ]= "🟡 Titan Temple" ;
+        [ "Cherry Blossom" ]= "🌸 Cherry Blossom" ;
+        [ "Cosmic" ]= "🌌 Cosmic" ,[ "Prehistoric" ]= "🦖 Prehistoric" ;
+        [ "Abyss Ocean" ]= "🌊 Abyss Ocean" ;
+        [ "Volcano" ]= "🌋 Volcano" ;
+        [ "Snow" ]= "❄️ Snow" ,[ "Jungle" ]= "🌴 Jungle" ,[ "Desert" ]= "🏜️ Desert" ;
+        [ "Lake" ]= "💧 Lake" ,[ "Forest" ]= "🌲 Forest" }
         local n={}
         for e,r in pairs(h.selectedZones or{})do
             if r and q[e]then
@@ -4756,21 +4950,21 @@ local function oM(...)
             h.selectedZones =r x()
         end
         })Fk.secEggRarity =Ok:Section({[ "Title" ]=(P.EggSelect and P.EggSelect.SecRarities )or "Target Rarities" })
-        local I={ "ðŸ‘‘ Divine (Tier 6)" ;
-        "âš¡ Eternal (Tier 5)" , "ðŸ”¥ Secret (Tier 4)" , "âœ¨ Cosmic (Tier 3)" , "ðŸ”® Mythic (Tier 2)" ;
-        "â­ Legendary (Tier 1)" ;
-        "ðŸ’œ Epic" ;
-        "ðŸ”· Rare" ;
-        "ðŸŸ¢ Uncommon" , "âšª Common" }
-        local L={[ "ðŸ‘‘ Divine (Tier 6)" ]= "Divine" ,[ "âš¡ Eternal (Tier 5)" ]= "Eternal" ,[ "ðŸ”¥ Secret (Tier 4)" ]= "Secret" ;
-        [ "âœ¨ Cosmic (Tier 3)" ]= "Cosmic" ;
-        [ "ðŸ”® Mythic (Tier 2)" ]= "Mythic" ;
-        [ "â­ Legendary (Tier 1)" ]= "Legendary" ,[ "ðŸ’œ Epic" ]= "Epic" ,[ "ðŸ”· Rare" ]= "Rare" ,[ "ðŸŸ¢ Uncommon" ]= "Uncommon" ,[ "âšª Common" ]= "Common" }
-        local E={[ "Divine" ]= "ðŸ‘‘ Divine (Tier 6)" ,[ "Eternal" ]= "âš¡ Eternal (Tier 5)" ;
-        [ "Secret" ]= "ðŸ”¥ Secret (Tier 4)" ;
-        [ "Cosmic" ]= "âœ¨ Cosmic (Tier 3)" ,[ "Mythic" ]= "ðŸ”® Mythic (Tier 2)" ,[ "Legendary" ]= "â­ Legendary (Tier 1)" ,[ "Epic" ]= "ðŸ’œ Epic" ,[ "Rare" ]= "ðŸ”· Rare" ;
-        [ "Uncommon" ]= "ðŸŸ¢ Uncommon" ;
-        [ "Common" ]= "âšª Common" }
+        local I={ "👑 Divine (Tier 6)" ;
+        "⚡ Eternal (Tier 5)" , "🔥 Secret (Tier 4)" , "✨ Cosmic (Tier 3)" , "🔮 Mythic (Tier 2)" ;
+        "⭐ Legendary (Tier 1)" ;
+        "💜 Epic" ;
+        "🔷 Rare" ;
+        "🟢 Uncommon" , "⚪ Common" }
+        local L={[ "👑 Divine (Tier 6)" ]= "Divine" ,[ "⚡ Eternal (Tier 5)" ]= "Eternal" ,[ "🔥 Secret (Tier 4)" ]= "Secret" ;
+        [ "✨ Cosmic (Tier 3)" ]= "Cosmic" ;
+        [ "🔮 Mythic (Tier 2)" ]= "Mythic" ;
+        [ "⭐ Legendary (Tier 1)" ]= "Legendary" ,[ "💜 Epic" ]= "Epic" ,[ "🔷 Rare" ]= "Rare" ,[ "🟢 Uncommon" ]= "Uncommon" ,[ "⚪ Common" ]= "Common" }
+        local E={[ "Divine" ]= "👑 Divine (Tier 6)" ,[ "Eternal" ]= "⚡ Eternal (Tier 5)" ;
+        [ "Secret" ]= "🔥 Secret (Tier 4)" ;
+        [ "Cosmic" ]= "✨ Cosmic (Tier 3)" ,[ "Mythic" ]= "🔮 Mythic (Tier 2)" ,[ "Legendary" ]= "⭐ Legendary (Tier 1)" ,[ "Epic" ]= "💜 Epic" ,[ "Rare" ]= "🔷 Rare" ;
+        [ "Uncommon" ]= "🟢 Uncommon" ;
+        [ "Common" ]= "⚪ Common" }
         local b={}
         for e,r in pairs(h.selectedRarities or{})do
             if r and E[e]then
@@ -4825,10 +5019,10 @@ local function oM(...)
         [ "Default" ]=h.glideSpeed or 600 },[ "Callback" ]=function(e,...) h.glideSpeed =e Y(e)
         end
         })Fk.secDashboard =Tk:Section({[ "Title" ]=P.Settings.SecDashboard })Fk.paraLiveDash =Tk:Paragraph({[ "Title" ]=P.Settings.DashTitle ;
-        [ "Desc" ]=string.format ( "Status: Ready\nFarm Mode: Idle\nCarried Eggs: 0\nFlight Speed: %d Studs/s" ,h.glideSpeed or 600 )})Fk.secUI =Tk:Section({[ "Title" ]=P.Settings.SecUI })Fk.dropLang =Tk:Dropdown({[ "Title" ]=P.Settings.LangTitle ,[ "Values" ]={ "English" , "à¹„à¸—à¸¢" },[ "Value" ]=(Xk== "EN" and "English" or "à¹„à¸—à¸¢" ),[ "Callback" ]=function(e,...)
-            local r=(e== "à¹„à¸—à¸¢" )and "TH" or "EN"
+        [ "Desc" ]=string.format ( "Status: Ready\nFarm Mode: Idle\nCarried Eggs: 0\nFlight Speed: %d Studs/s" ,h.glideSpeed or 600 )})Fk.secUI =Tk:Section({[ "Title" ]=P.Settings.SecUI })Fk.dropLang =Tk:Dropdown({[ "Title" ]=P.Settings.LangTitle ,[ "Values" ]={ "English" , "ไทย" },[ "Value" ]=(Xk== "EN" and "English" or "ไทย" ),[ "Callback" ]=function(e,...)
+            local r=(e== "ไทย" )and "TH" or "EN"
             if r~=Xk then
-                Xk=r wM(Xk)pcall(x)j({[ "Title" ]=(Xk== "TH" )and "à¸ à¸²à¸©à¸²" or "Language" ,[ "Content" ]=Gk[Xk].Notifications.LangSwitched ,[ "Icon" ]= "check-circle" })
+                Xk=r wM(Xk)pcall(x)j({[ "Title" ]=(Xk== "TH" )and "ภาษา" or "Language" ,[ "Content" ]=Gk[Xk].Notifications.LangSwitched ,[ "Icon" ]= "check-circle" })
             end
         end
         })Fk.sliderTransp =Tk:Slider({[ "Title" ]=P.Settings.TranspTitle ;
@@ -4903,7 +5097,7 @@ local function oM(...)
                         end
                         pcall(function(...)
                             if B.SetTitle then
-                                B:SetTitle(((y and "à¸ªà¸–à¸²à¸™à¸°: " or "Status: " ))..u)
+                                B:SetTitle(((y and "สถานะ: " or "Status: " ))..u)
                             end
                             if B.SetColor then
                                 B:SetColor(e)
@@ -4912,13 +5106,13 @@ local function oM(...)
                         )
                     end
                     if Fk.paraLiveDash and Fk.paraLiveDash.SetDesc then
-                        local e=y and "à¸«à¸¢à¸¸à¸”à¸žà¸±à¸" or "Idle"
+                        local e=y and "หยุดพัก" or "Idle"
                         if Y4== "TWEEN" then
-                            e=y and "à¸‚à¹‚à¸¡à¸¢à¹„à¸‚à¹ˆ (à¸šà¸´à¸™à¹€à¸£à¹‡à¸§)" or "Auto Steal (Tween)"
+                            e=y and "ขโมยไข่ (บินเร็ว)" or "Auto Steal (Tween)"
                         elseif Y4== "WARP" then
-                            e=y and "à¸‚à¹‚à¸¡à¸¢à¹„à¸‚à¹ˆ (à¸§à¸²à¸£à¹Œà¸›)" or "Auto Steal (Teleport)"
+                            e=y and "ขโมยไข่ (วาร์ป)" or "Auto Steal (Teleport)"
                         end
-                        local j=y and "à¸ªà¸–à¸²à¸™à¸°: %s\nà¹‚à¸«à¸¡à¸”à¸Ÿà¸²à¸£à¹Œà¸¡: %s\nà¸ˆà¸³à¸™à¸§à¸™à¹„à¸‚à¹ˆà¹ƒà¸™à¸•à¸±à¸§: %d à¸Ÿà¸­à¸‡\nà¸„à¸§à¸²à¸¡à¹€à¸£à¹‡à¸§à¸šà¸´à¸™: %d Studs/s" or "Status: %s\nFarm Mode: %s\nCarried Eggs: %d\nFlight Speed: %d Studs/s"
+                        local j=y and "สถานะ: %s\nโหมดฟาร์ม: %s\nจำนวนไข่ในตัว: %d ฟอง\nความเร็วบิน: %d Studs/s" or "Status: %s\nFarm Mode: %s\nCarried Eggs: %d\nFlight Speed: %d Studs/s"
                         local k=string.format (j,u,e,r,h.glideSpeed or 600 )pcall(function(...) Fk.paraLiveDash :SetDesc(k)
                         end
                         )
@@ -4966,7 +5160,7 @@ local function oM(...)
     local N=Instance.new ( "UIStroke" )N.Color =p N.Thickness = 1.4 N.Parent =Q
     local U=Instance.new ( "Frame" )U.Name = "Header" U.Size =UDim2.new ( 1 , 0 , 0 , 46 )U.BackgroundColor3 =H U.BorderSizePixel = 0 U.Parent =Q;
     (Instance.new ( "UICorner" ,U)).CornerRadius =UDim.new ( 0 , 12 )
-    local l=Instance.new ( "TextLabel" )l.Size =UDim2.new ( 1 , -90 , 0 , 22 )l.Position =UDim2.new ( 0 , 12 , 0 , 6 )l.BackgroundTransparency = 1 l.Text = "NYXEON CHEAT (Fallback)" l.TextColor3 =B l.TextSize = 14 l.Font =Enum.Font.GothamBold l.TextXAlignment =Enum.TextXAlignment.Left l.AutoLocalize = false l.Parent =U
+    local l=Instance.new ( "TextLabel" )l.Size =UDim2.new ( 1 , -90 , 0 , 22 )l.Position =UDim2.new ( 0 , 12 , 0 , 6 )l.BackgroundTransparency = 1 l.Text = "Lunaris CHEAT (Fallback)" l.TextColor3 =B l.TextSize = 14 l.Font =Enum.Font.GothamBold l.TextXAlignment =Enum.TextXAlignment.Left l.AutoLocalize = false l.Parent =U
     local D=Instance.new ( "TextLabel" )D.Size =UDim2.new ( 1 , -90 , 0 , 14 )D.Position =UDim2.new ( 0 , 12 , 0 , 26 )D.BackgroundTransparency = 1 D.Text = "Steal an Egg v42.64" D.TextColor3 =Color3.fromRGB ( 0 , 255 , 160 )D.TextSize = 11 D.Font =Enum.Font.Gotham D.TextXAlignment =Enum.TextXAlignment.Left D.AutoLocalize = false D.Parent =U
     local C=Instance.new ( "TextButton" )C.Size =UDim2.new ( 0 , 28 , 0 , 28 )C.Position =UDim2.new ( 1 , -68 , 0 , 9 )C.BackgroundColor3 =t C.Text = "-" C.TextColor3 =B C.TextSize = 16 C.Font =Enum.Font.GothamBold C.AutoButtonColor = false C.Parent =U;
     (Instance.new ( "UICorner" ,C)).CornerRadius =UDim.new ( 0 , 6 )
@@ -5100,8 +5294,154 @@ local function oM(...)
     end
     )A( "Get Out Treadmill" , "Instantly escape from treadmill or gear" ,Color3.fromRGB ( 249 , 115 , 22 ), 32 ,function(...) pcall(M4)pcall(C4)pcall(D4)
     end
-    )E( "CONTROLS & SETTINGS" , 40 )
-    local F=Instance.new ( "Frame" )F.Size =UDim2.new ( 1 , 0 , 0 , 48 )F.BackgroundColor3 =t F.LayoutOrder = 41 F.Parent =n;
+    )E( "DISCORD WEBHOOK" , 40 )
+    local Wh=Instance.new("Frame") Wh.Size=UDim2.new(1,0,0,294) Wh.BackgroundColor3=t Wh.LayoutOrder=41 Wh.Parent=n;
+    (Instance.new("UICorner",Wh)).CornerRadius=UDim.new(0,10)
+    local WhStroke=Instance.new("UIStroke",Wh) WhStroke.Color=Color3.fromRGB(50,58,78) WhStroke.Thickness=1 WhStroke.Transparency=0.35
+
+    local WhTitle=Instance.new("TextLabel") WhTitle.Size=UDim2.new(1,-24,0,22) WhTitle.Position=UDim2.new(0,12,0,9) WhTitle.BackgroundTransparency=1 WhTitle.Text="🌙 Lunaris Webhook Center" WhTitle.TextColor3=B WhTitle.TextSize=14 WhTitle.Font=Enum.Font.GothamBold WhTitle.TextXAlignment=Enum.TextXAlignment.Left WhTitle.AutoLocalize=false WhTitle.Parent=Wh
+    local WhSub=Instance.new("TextLabel") WhSub.Size=UDim2.new(1,-24,0,18) WhSub.Position=UDim2.new(0,12,0,31) WhSub.BackgroundTransparency=1 WhSub.Text="Stats-only Discord reports • no player/account data" WhSub.TextColor3=J WhSub.TextSize=10 WhSub.Font=Enum.Font.Gotham WhSub.TextXAlignment=Enum.TextXAlignment.Left WhSub.AutoLocalize=false WhSub.Parent=Wh
+
+    local WhBox=Instance.new("TextBox") WhBox.Size=UDim2.new(1,-24,0,30) WhBox.Position=UDim2.new(0,12,0,56) WhBox.BackgroundColor3=Color3.fromRGB(28,32,44) WhBox.TextColor3=B WhBox.PlaceholderColor3=Color3.fromRGB(120,130,150) WhBox.PlaceholderText="Enter Your Webhook" WhBox.Text=LunarisWebhookConfigured() and LUNARIS_WEBHOOK_URL or "" WhBox.ClearTextOnFocus=false WhBox.TextSize=11 WhBox.Font=Enum.Font.Gotham WhBox.TextXAlignment=Enum.TextXAlignment.Left WhBox.TextTruncate=Enum.TextTruncate.AtEnd WhBox.AutoLocalize=false WhBox.Parent=Wh
+    (Instance.new("UICorner",WhBox)).CornerRadius=UDim.new(0,7)
+
+    local WhSave=Instance.new("TextButton") WhSave.Size=UDim2.new(0.24,-4,0,28) WhSave.Position=UDim2.new(0,12,0,94) WhSave.BackgroundColor3=Color3.fromRGB(0,185,255) WhSave.Text="SAVE" WhSave.TextColor3=Color3.new(1,1,1) WhSave.TextSize=11 WhSave.Font=Enum.Font.GothamBold WhSave.AutoButtonColor=false WhSave.Parent=Wh
+    (Instance.new("UICorner",WhSave)).CornerRadius=UDim.new(0,7)
+
+    local WhTest=Instance.new("TextButton") WhTest.Size=UDim2.new(0.24,-4,0,28) WhTest.Position=UDim2.new(0.25,0,0,94) WhTest.BackgroundColor3=Color3.fromRGB(41,48,66) WhTest.Text="TEST" WhTest.TextColor3=B WhTest.TextSize=11 WhTest.Font=Enum.Font.GothamBold WhTest.AutoButtonColor=false WhTest.Parent=Wh
+    (Instance.new("UICorner",WhTest)).CornerRadius=UDim.new(0,7)
+
+    local WhNow=Instance.new("TextButton") WhNow.Size=UDim2.new(0.24,-4,0,28) WhNow.Position=UDim2.new(0.50,0,0,94) WhNow.BackgroundColor3=Color3.fromRGB(36,120,94) WhNow.Text="SEND NOW" WhNow.TextColor3=Color3.new(1,1,1) WhNow.TextSize=11 WhNow.Font=Enum.Font.GothamBold WhNow.AutoButtonColor=false WhNow.Parent=Wh
+    (Instance.new("UICorner",WhNow)).CornerRadius=UDim.new(0,7)
+
+    local WhClear=Instance.new("TextButton") WhClear.Size=UDim2.new(0.24,-4,0,28) WhClear.Position=UDim2.new(0.75,0,0,94) WhClear.BackgroundColor3=Color3.fromRGB(90,45,55) WhClear.Text="CLEAR" WhClear.TextColor3=B WhClear.TextSize=11 WhClear.Font=Enum.Font.GothamBold WhClear.AutoButtonColor=false WhClear.Parent=Wh
+    (Instance.new("UICorner",WhClear)).CornerRadius=UDim.new(0,7)
+
+    local WhToggle=Instance.new("TextButton") WhToggle.Size=UDim2.new(0.48,-6,0,30) WhToggle.Position=UDim2.new(0,12,0,130) WhToggle.BackgroundColor3=Color3.fromRGB(28,32,44) WhToggle.Text="" WhToggle.AutoButtonColor=false WhToggle.Parent=Wh
+    (Instance.new("UICorner",WhToggle)).CornerRadius=UDim.new(0,7)
+    local WhToggleText=Instance.new("TextLabel") WhToggleText.Size=UDim2.new(1,-16,1,0) WhToggleText.Position=UDim2.new(0,8,0,0) WhToggleText.BackgroundTransparency=1 WhToggleText.TextColor3=B WhToggleText.TextSize=11 WhToggleText.Font=Enum.Font.GothamBold WhToggleText.TextXAlignment=Enum.TextXAlignment.Left WhToggleText.Parent=WhToggle
+
+    local WhInterval=Instance.new("TextButton") WhInterval.Size=UDim2.new(0.48,-6,0,30) WhInterval.Position=UDim2.new(0.52,0,0,130) WhInterval.BackgroundColor3=Color3.fromRGB(41,48,66) WhInterval.Text="INTERVAL: 10M" WhInterval.TextColor3=B WhInterval.TextSize=11 WhInterval.Font=Enum.Font.GothamBold WhInterval.AutoButtonColor=false WhInterval.Parent=Wh
+    (Instance.new("UICorner",WhInterval)).CornerRadius=UDim.new(0,7)
+
+    local WhStats=Instance.new("Frame") WhStats.Size=UDim2.new(1,-24,0,54) WhStats.Position=UDim2.new(0,12,0,168) WhStats.BackgroundColor3=Color3.fromRGB(20,24,34) WhStats.Parent=Wh
+    (Instance.new("UICorner",WhStats)).CornerRadius=UDim.new(0,7)
+
+    local WhStat1=Instance.new("TextLabel") WhStat1.Size=UDim2.new(0.25,0,1,0) WhStat1.Position=UDim2.new(0,6,0,0) WhStat1.BackgroundTransparency=1 WhStat1.TextColor3=Color3.fromRGB(255,105,140) WhStat1.TextSize=11 WhStat1.Font=Enum.Font.GothamBold WhStat1.Parent=WhStats
+    local WhStat2=Instance.new("TextLabel") WhStat2.Size=UDim2.new(0.25,0,1,0) WhStat2.Position=UDim2.new(0.25,0,0,0) WhStat2.BackgroundTransparency=1 WhStat2.TextColor3=Color3.fromRGB(225,105,240) WhStat2.TextSize=11 WhStat2.Font=Enum.Font.GothamBold WhStat2.Parent=WhStats
+    local WhStat3=Instance.new("TextLabel") WhStat3.Size=UDim2.new(0.25,0,1,0) WhStat3.Position=UDim2.new(0.50,0,0,0) WhStat3.BackgroundTransparency=1 WhStat3.TextColor3=Color3.fromRGB(255,150,75) WhStat3.TextSize=11 WhStat3.Font=Enum.Font.GothamBold WhStat3.Parent=WhStats
+    local WhStat4=Instance.new("TextLabel") WhStat4.Size=UDim2.new(0.25,0,1,0) WhStat4.Position=UDim2.new(0.75,0,0,0) WhStat4.BackgroundTransparency=1 WhStat4.TextColor3=Color3.fromRGB(100,220,255) WhStat4.TextSize=11 WhStat4.Font=Enum.Font.GothamBold WhStat4.Parent=WhStats
+
+    local WhReset=Instance.new("TextButton") WhReset.Size=UDim2.new(1,-24,0,28) WhReset.Position=UDim2.new(0,12,0,228) WhReset.BackgroundColor3=Color3.fromRGB(41,48,66) WhReset.Text="RESET SESSION STATS" WhReset.TextColor3=B WhReset.TextSize=11 WhReset.Font=Enum.Font.GothamBold WhReset.AutoButtonColor=false WhReset.Parent=Wh
+    (Instance.new("UICorner",WhReset)).CornerRadius=UDim.new(0,7)
+
+    local WhInfo=Instance.new("TextLabel") WhInfo.Size=UDim2.new(1,-24,0,32) WhInfo.Position=UDim2.new(0,12,0,260) WhInfo.BackgroundTransparency=1 WhInfo.TextColor3=J WhInfo.TextSize=10 WhInfo.Font=Enum.Font.Gotham WhInfo.TextXAlignment=Enum.TextXAlignment.Left WhInfo.TextYAlignment=Enum.TextYAlignment.Top WhInfo.Parent=Wh
+
+    local function WhRefresh(...)
+        local uptime=math.max(0,math.floor(os.clock()-LunarisStartTime))
+        local nextIn=math.max(0,math.floor((LUNARIS_WEBHOOK_NEXT_AT>0 and LUNARIS_WEBHOOK_NEXT_AT or (os.clock()+LUNARIS_WEBHOOK_INTERVAL))-os.clock()))
+        local mins=math.max(1,math.floor((LUNARIS_WEBHOOK_INTERVAL or 600)/60))
+        WhStat1.Text="👑 "..tostring(LunarisStats.Divine or 0)
+        WhStat2.Text="⚡ "..tostring(LunarisStats.Eternal or 0)
+        WhStat3.Text="🔥 "..tostring(LunarisStats.Secret or 0)
+        WhStat4.Text="⏱ "..LunarisFormatUptime(uptime)
+        WhToggle.Text="Webhook Reports: "..(LUNARIS_WEBHOOK_ENABLED and "ON" or "OFF")
+        WhToggle.TextColor3=LUNARIS_WEBHOOK_ENABLED and Color3.fromRGB(0,255,160) or Color3.fromRGB(150,160,180)
+        WhInterval.Text="INTERVAL: "..tostring(mins).."M"
+        WhInfo.Text="Status: "..tostring(LUNARIS_WEBHOOK_LAST_STATUS)..
+            "   •   Next: "..(LUNARIS_WEBHOOK_ENABLED and LunarisFormatUptime(nextIn) or "Disabled")..
+            "   •   Reports: "..tostring(LUNARIS_WEBHOOK_SENT or 0)
+    end
+
+    WhSave.MouseButton1Click:Connect(function(...)
+        local url=LunarisTrim(WhBox.Text)
+        if url~="" and string.find(url,"/api/webhooks/",1,true)==nil then
+            LUNARIS_WEBHOOK_LAST_STATUS="Invalid Discord webhook URL"
+        else
+            LUNARIS_WEBHOOK_URL=url
+            LUNARIS_WEBHOOK_ENABLED=url~=""
+            LUNARIS_WEBHOOK_LAST_STATUS=(url~="" and "Webhook saved" or "Webhook cleared")
+            LUNARIS_WEBHOOK_NEXT_AT=os.clock()+LUNARIS_WEBHOOK_INTERVAL
+            LunarisSaveWebhookConfig()
+        end
+        WhRefresh()
+    end)
+
+    WhTest.MouseButton1Click:Connect(function(...)
+        if not LunarisWebhookConfigured() then
+            LUNARIS_WEBHOOK_LAST_STATUS="Enter a valid webhook first"
+        else
+            task.spawn(function(...)
+                LUNARIS_WEBHOOK_LAST_STATUS="Sending test..."
+                WhRefresh()
+                local ok=LunarisSendUptimeWebhook()
+                LUNARIS_WEBHOOK_LAST_STATUS=ok and "✓ Test delivered" or LUNARIS_WEBHOOK_LAST_STATUS
+                WhRefresh()
+            end)
+        end
+        WhRefresh()
+    end)
+
+    WhNow.MouseButton1Click:Connect(function(...)
+        if not LunarisWebhookConfigured() then
+            LUNARIS_WEBHOOK_LAST_STATUS="Enter a valid webhook first"
+        else
+            task.spawn(function(...)
+                LUNARIS_WEBHOOK_LAST_STATUS="Sending report..."
+                WhRefresh()
+                LunarisSendUptimeWebhook()
+                WhRefresh()
+            end)
+        end
+        WhRefresh()
+    end)
+
+    WhClear.MouseButton1Click:Connect(function(...)
+        LUNARIS_WEBHOOK_URL=""
+        LUNARIS_WEBHOOK_ENABLED=false
+        WhBox.Text=""
+        LUNARIS_WEBHOOK_LAST_STATUS="Webhook cleared"
+        LunarisSaveWebhookConfig()
+        WhRefresh()
+    end)
+
+    WhToggle.MouseButton1Click:Connect(function(...)
+        LUNARIS_WEBHOOK_ENABLED=not LUNARIS_WEBHOOK_ENABLED
+        LUNARIS_WEBHOOK_NEXT_AT=os.clock()+LUNARIS_WEBHOOK_INTERVAL
+        LUNARIS_WEBHOOK_LAST_STATUS=LUNARIS_WEBHOOK_ENABLED and "Webhook enabled" or "Webhook disabled"
+        LunarisSaveWebhookConfig()
+        WhRefresh()
+    end)
+
+    WhInterval.MouseButton1Click:Connect(function(...)
+        local options={60,300,600,900,1800,3600}
+        local current=LUNARIS_WEBHOOK_INTERVAL or 600
+        local idx=1
+        for i,v in ipairs(options) do
+            if v==current then idx=i break end
+        end
+        idx=idx%#options+1
+        LUNARIS_WEBHOOK_INTERVAL=options[idx]
+        LUNARIS_WEBHOOK_NEXT_AT=os.clock()+LUNARIS_WEBHOOK_INTERVAL
+        LUNARIS_WEBHOOK_LAST_STATUS="Interval set to "..tostring(math.floor(LUNARIS_WEBHOOK_INTERVAL/60)).."m"
+        LunarisSaveWebhookConfig()
+        WhRefresh()
+    end)
+
+    WhReset.MouseButton1Click:Connect(function(...)
+        LunarisResetWebhookStats()
+        WhRefresh()
+    end)
+
+    task.spawn(function(...)
+        while h and h.alive and Wh and Wh.Parent do
+            WhRefresh()
+            task.wait(1)
+        end
+    end)
+
+    )E( "CONTROLS & SETTINGS" , 50 )
+    local F=Instance.new ( "Frame" )F.Size =UDim2.new ( 1 , 0 , 0 , 48 )F.BackgroundColor3 =t F.LayoutOrder = 51 F.Parent =n;
     (Instance.new ( "UICorner" ,F)).CornerRadius =UDim.new ( 0 , 8 )
     local O=Instance.new ( "TextLabel" )O.Size =UDim2.new ( 1 , -130 , 0 , 18 )O.Position =UDim2.new ( 0 , 10 , 0 , 6 )O.BackgroundTransparency = 1 O.Text = "Flight Speed" O.TextColor3 =B O.TextSize = 13 O.Font =Enum.Font.GothamBold O.TextXAlignment =Enum.TextXAlignment.Left O.AutoLocalize = false O.Parent =F
     local T=Instance.new ( "TextLabel" )T.Size =UDim2.new ( 0 , 70 , 0 , 24 )T.Position =UDim2.new ( 1 , -80 , 0.5 , -12 )T.BackgroundColor3 =V T.Text =string.format ( "%d Studs/s" ,h.glideSpeed or 600 )T.TextColor3 =Color3.fromRGB ( 0 , 255 , 160 )T.TextSize = 11 T.Font =Enum.Font.GothamBold T.AutoLocalize = false T.Parent =F;
@@ -5113,12 +5453,12 @@ local function oM(...)
     end
     )m.MouseButton1Click :Connect(function(...) h.glideSpeed =math.min ( 1000 ,((h.glideSpeed or 600 ))+ 25 )T.Text =string.format ( "%d Studs/s" ,h.glideSpeed )Y(h.glideSpeed )
     end
-    )A( "Reset Character State" , "Clear velocity, cancel push & unfreeze" ,Color3.fromRGB ( 99 , 102 , 241 ), 42 ,function(...) pcall(D4)pcall(u4)
+    )A( "Reset Character State" , "Clear velocity, cancel push & unfreeze" ,Color3.fromRGB ( 99 , 102 , 241 ), 52 ,function(...) pcall(D4)pcall(u4)
     end
-    )A( "Unload Script" , "Destroy UI and stop all background loops" ,Color3.fromRGB ( 153 , 27 , 27 ), 43 ,function(...) aM()
+    )A( "Unload Script" , "Destroy UI and stop all background loops" ,Color3.fromRGB ( 153 , 27 , 27 ), 53 ,function(...) aM()
     end
-    )E( "EGG SELECT (ZONES & RARITIES)" , 45 )
-    local e4=Instance.new ( "TextButton" )e4.Size =UDim2.new ( 1 , 0 , 0 , 48 )e4.BackgroundColor3 =t e4.LayoutOrder = 46 e4.Text = "" e4.AutoButtonColor = false e4.Parent =n;
+    )E( "EGG SELECT (ZONES & RARITIES)" , 55 )
+    local e4=Instance.new ( "TextButton" )e4.Size =UDim2.new ( 1 , 0 , 0 , 48 )e4.BackgroundColor3 =t e4.LayoutOrder = 56 e4.Text = "" e4.AutoButtonColor = false e4.Parent =n;
     (Instance.new ( "UICorner" ,e4)).CornerRadius =UDim.new ( 0 , 8 )
     local function r4(...)
         local e= 0
@@ -5129,10 +5469,10 @@ local function oM(...)
         end
         return e
     end
-    local w4=Instance.new ( "TextLabel" )w4.Size =UDim2.new ( 1 , -50 , 0 , 18 )w4.Position =UDim2.new ( 0 , 10 , 0 , 6 )w4.BackgroundTransparency = 1 w4.Text =string.format ( "ðŸ“ Target Zones (%d/12 Active)" ,r4())w4.TextColor3 =Color3.fromRGB ( 0 , 220 , 255 )w4.TextSize = 13 w4.Font =Enum.Font.GothamBold w4.TextXAlignment =Enum.TextXAlignment.Left w4.AutoLocalize = false w4.Parent =e4
+    local w4=Instance.new ( "TextLabel" )w4.Size =UDim2.new ( 1 , -50 , 0 , 18 )w4.Position =UDim2.new ( 0 , 10 , 0 , 6 )w4.BackgroundTransparency = 1 w4.Text =string.format ( "📍 Target Zones (%d/12 Active)" ,r4())w4.TextColor3 =Color3.fromRGB ( 0 , 220 , 255 )w4.TextSize = 13 w4.Font =Enum.Font.GothamBold w4.TextXAlignment =Enum.TextXAlignment.Left w4.AutoLocalize = false w4.Parent =e4
     local j4=Instance.new ( "TextLabel" )j4.Size =UDim2.new ( 1 , -50 , 0 , 16 )j4.Position =UDim2.new ( 0 , 10 , 0 , 26 )j4.BackgroundTransparency = 1 j4.Text = "Click to expand / collapse zone selection" j4.TextColor3 =J j4.TextSize = 10 j4.Font =Enum.Font.Gotham j4.TextXAlignment =Enum.TextXAlignment.Left j4.AutoLocalize = false j4.Parent =e4
-    local k4=Instance.new ( "TextLabel" )k4.Size =UDim2.new ( 0 , 30 , 0 , 30 )k4.Position =UDim2.new ( 1 , -38 , 0.5 , -15 )k4.BackgroundTransparency = 1 k4.Text = "â–¼" k4.TextColor3 =J k4.TextSize = 12 k4.Font =Enum.Font.GothamBold k4.Parent =e4
-    local a4=Instance.new ( "Frame" )a4.Size =UDim2.new ( 1 , 0 , 0 , 0 )a4.BackgroundColor3 =Color3.fromRGB ( 18 , 20 , 28 )a4.LayoutOrder = 47 a4.Visible = false a4.ClipsDescendants = true a4.Parent =n;
+    local k4=Instance.new ( "TextLabel" )k4.Size =UDim2.new ( 0 , 30 , 0 , 30 )k4.Position =UDim2.new ( 1 , -38 , 0.5 , -15 )k4.BackgroundTransparency = 1 k4.Text = "▼" k4.TextColor3 =J k4.TextSize = 12 k4.Font =Enum.Font.GothamBold k4.Parent =e4
+    local a4=Instance.new ( "Frame" )a4.Size =UDim2.new ( 1 , 0 , 0 , 0 )a4.BackgroundColor3 =Color3.fromRGB ( 18 , 20 , 28 )a4.LayoutOrder = 57 a4.Visible = false a4.ClipsDescendants = true a4.Parent =n;
     (Instance.new ( "UICorner" ,a4)).CornerRadius =UDim.new ( 0 , 8 )
     local o4=Instance.new ( "UIGridLayout" )o4.CellSize =UDim2.new ( 0.48 , 0 , 0 , 32 )o4.CellPadding =UDim2.new ( 0.04 , 0 , 0 , 6 )o4.SortOrder =Enum.SortOrder.LayoutOrder o4.Parent =a4;
     (Instance.new ( "UIPadding" ,a4)).PaddingTop =UDim.new ( 0 , 8 )a4.UIPadding.PaddingBottom =UDim.new ( 0 , 8 )a4.UIPadding.PaddingLeft =UDim.new ( 0 , 8 )a4.UIPadding.PaddingRight =UDim.new ( 0 , 8 )
@@ -5143,7 +5483,7 @@ local function oM(...)
         local function u(...)
             local e=h.selectedZones and h.selectedZones [r]== true
             if e then
-                y.BackgroundColor3 =d[r]or Color3.fromRGB ( 59 , 130 , 246 )y.TextColor3 =Color3.new ( 1 , 1 , 1 )y.Text = "âœ“ " ..r
+                y.BackgroundColor3 =d[r]or Color3.fromRGB ( 59 , 130 , 246 )y.TextColor3 =Color3.new ( 1 , 1 , 1 )y.Text = "✓ " ..r
             else
                 y.BackgroundColor3 =Color3.fromRGB ( 28 , 32 , 44 )y.TextColor3 =Color3.fromRGB ( 140 , 150 , 170 )y.Text =r
             end
@@ -5152,11 +5492,11 @@ local function oM(...)
             if not h.selectedZones then
                 h.selectedZones ={}
             end
-            h.selectedZones [r]=not((h.selectedZones [r]== true ))u()x()w4.Text =string.format ( "ðŸ“ Target Zones (%d/12 Active)" ,r4())
+            h.selectedZones [r]=not((h.selectedZones [r]== true ))u()x()w4.Text =string.format ( "📍 Target Zones (%d/12 Active)" ,r4())
         end
         )y.Parent =a4 V4[r]=y
     end
-    local H4= false e4.MouseButton1Click :Connect(function(...) H4=not H4 a4.Visible =H4 a4.Size =H4 and UDim2.new ( 1 , 0 , 0 , 240 )or UDim2.new ( 1 , 0 , 0 , 0 )k4.Text =H4 and "â–²" or "â–¼"
+    local H4= false e4.MouseButton1Click :Connect(function(...) H4=not H4 a4.Visible =H4 a4.Size =H4 and UDim2.new ( 1 , 0 , 0 , 240 )or UDim2.new ( 1 , 0 , 0 , 0 )k4.Text =H4 and "▲" or "▼"
     end
     )
     local function t4(...)
@@ -5168,12 +5508,12 @@ local function oM(...)
         end
         return e
     end
-    local s4=Instance.new ( "TextButton" )s4.Size =UDim2.new ( 1 , 0 , 0 , 48 )s4.BackgroundColor3 =t s4.LayoutOrder = 48 s4.Text = "" s4.AutoButtonColor = false s4.Parent =n;
+    local s4=Instance.new ( "TextButton" )s4.Size =UDim2.new ( 1 , 0 , 0 , 48 )s4.BackgroundColor3 =t s4.LayoutOrder = 58 s4.Text = "" s4.AutoButtonColor = false s4.Parent =n;
     (Instance.new ( "UICorner" ,s4)).CornerRadius =UDim.new ( 0 , 8 )
-    local p4=Instance.new ( "TextLabel" )p4.Size =UDim2.new ( 1 , -50 , 0 , 18 )p4.Position =UDim2.new ( 0 , 10 , 0 , 6 )p4.BackgroundTransparency = 1 p4.Text =string.format ( "ðŸ¥š Target Rarities (%d/%d Active)" ,t4(),#X)p4.TextColor3 =Color3.fromRGB ( 255 , 180 , 0 )p4.TextSize = 13 p4.Font =Enum.Font.GothamBold p4.TextXAlignment =Enum.TextXAlignment.Left p4.AutoLocalize = false p4.Parent =s4
+    local p4=Instance.new ( "TextLabel" )p4.Size =UDim2.new ( 1 , -50 , 0 , 18 )p4.Position =UDim2.new ( 0 , 10 , 0 , 6 )p4.BackgroundTransparency = 1 p4.Text =string.format ( "🥚 Target Rarities (%d/%d Active)" ,t4(),#X)p4.TextColor3 =Color3.fromRGB ( 255 , 180 , 0 )p4.TextSize = 13 p4.Font =Enum.Font.GothamBold p4.TextXAlignment =Enum.TextXAlignment.Left p4.AutoLocalize = false p4.Parent =s4
     local B4=Instance.new ( "TextLabel" )B4.Size =UDim2.new ( 1 , -50 , 0 , 16 )B4.Position =UDim2.new ( 0 , 10 , 0 , 26 )B4.BackgroundTransparency = 1 B4.Text = "Click to expand / collapse rarity selection" B4.TextColor3 =J B4.TextSize = 10 B4.Font =Enum.Font.Gotham B4.TextXAlignment =Enum.TextXAlignment.Left B4.AutoLocalize = false B4.Parent =s4
-    local J4=Instance.new ( "TextLabel" )J4.Size =UDim2.new ( 0 , 30 , 0 , 30 )J4.Position =UDim2.new ( 1 , -38 , 0.5 , -15 )J4.BackgroundTransparency = 1 J4.Text = "â–¼" J4.TextColor3 =J J4.TextSize = 12 J4.Font =Enum.Font.GothamBold J4.Parent =s4
-    local K4=Instance.new ( "Frame" )K4.Size =UDim2.new ( 1 , 0 , 0 , 0 )K4.BackgroundColor3 =Color3.fromRGB ( 18 , 20 , 28 )K4.LayoutOrder = 49 K4.Visible = false K4.ClipsDescendants = true K4.Parent =n;
+    local J4=Instance.new ( "TextLabel" )J4.Size =UDim2.new ( 0 , 30 , 0 , 30 )J4.Position =UDim2.new ( 1 , -38 , 0.5 , -15 )J4.BackgroundTransparency = 1 J4.Text = "▼" J4.TextColor3 =J J4.TextSize = 12 J4.Font =Enum.Font.GothamBold J4.Parent =s4
+    local K4=Instance.new ( "Frame" )K4.Size =UDim2.new ( 1 , 0 , 0 , 0 )K4.BackgroundColor3 =Color3.fromRGB ( 18 , 20 , 28 )K4.LayoutOrder = 59 K4.Visible = false K4.ClipsDescendants = true K4.Parent =n;
     (Instance.new ( "UICorner" ,K4)).CornerRadius =UDim.new ( 0 , 8 )
     local c4=Instance.new ( "UIGridLayout" )c4.CellSize =UDim2.new ( 0.48 , 0 , 0 , 32 )c4.CellPadding =UDim2.new ( 0.04 , 0 , 0 , 6 )c4.SortOrder =Enum.SortOrder.LayoutOrder c4.Parent =K4;
     (Instance.new ( "UIPadding" ,K4)).PaddingTop =UDim.new ( 0 , 8 )K4.UIPadding.PaddingBottom =UDim.new ( 0 , 8 )K4.UIPadding.PaddingLeft =UDim.new ( 0 , 8 )K4.UIPadding.PaddingRight =UDim.new ( 0 , 8 )
@@ -5183,7 +5523,7 @@ local function oM(...)
         local function u(...)
             local e=h.selectedRarities and h.selectedRarities [r]== true
             if e then
-                y.BackgroundColor3 =G[r]or Color3.fromRGB ( 249 , 115 , 22 )y.TextColor3 =Color3.new ( 1 , 1 , 1 )y.Text = "âœ“ " ..r
+                y.BackgroundColor3 =G[r]or Color3.fromRGB ( 249 , 115 , 22 )y.TextColor3 =Color3.new ( 1 , 1 , 1 )y.Text = "✓ " ..r
             else
                 y.BackgroundColor3 =Color3.fromRGB ( 28 , 32 , 44 )y.TextColor3 =Color3.fromRGB ( 140 , 150 , 170 )y.Text =r
             end
@@ -5192,17 +5532,31 @@ local function oM(...)
             if not h.selectedRarities then
                 h.selectedRarities ={}
             end
-            h.selectedRarities [r]=not((h.selectedRarities [r]== true ))u()x()p4.Text =string.format ( "ðŸ¥š Target Rarities (%d/%d Active)" ,t4(),#X)
+            h.selectedRarities [r]=not((h.selectedRarities [r]== true ))u()x()p4.Text =string.format ( "🥚 Target Rarities (%d/%d Active)" ,t4(),#X)
         end
         )y.Parent =K4
     end
-    local i4= false s4.MouseButton1Click :Connect(function(...) i4=not i4 K4.Visible =i4 K4.Size =i4 and UDim2.new ( 1 , 0 , 0 , 160 )or UDim2.new ( 1 , 0 , 0 , 0 )J4.Text =i4 and "â–²" or "â–¼"
+    local i4= false s4.MouseButton1Click :Connect(function(...) i4=not i4 K4.Visible =i4 K4.Size =i4 and UDim2.new ( 1 , 0 , 0 , 160 )or UDim2.new ( 1 , 0 , 0 , 0 )J4.Text =i4 and "▲" or "▼"
     end
     )e(function(...) Q.Visible = true
     end
     )
 end
-H( "[+] Initializing NYXEON ST CHEAT" )oM()task.spawn (function(...) task.wait ( 0.5 )A4()b4( true )C4()
+H( "[+] Initializing Lunaris ST CHEAT" )oM()
+LUNARIS_WEBHOOK_NEXT_AT = os.clock() + LUNARIS_WEBHOOK_INTERVAL
+task.spawn(function(...)
+    while h.alive do
+        if LUNARIS_WEBHOOK_ENABLED and LunarisWebhookConfigured() then
+            local now=os.clock()
+            if now >= (LUNARIS_WEBHOOK_NEXT_AT or 0) and not LunarisWebhookBusy then
+                pcall(LunarisSendUptimeWebhook)
+                LUNARIS_WEBHOOK_NEXT_AT = os.clock() + LUNARIS_WEBHOOK_INTERVAL
+            end
+        end
+        task.wait(1)
+    end
+end)
+task.spawn (function(...) task.wait ( 0.5 )A4()b4( true )C4()
     if o.Character then
         z4(o.Character )
     end
@@ -5225,4 +5579,4 @@ end
 if h.antiAFK then
     task.spawn (bk)
 end
-H( "[+] NYXEON ST CHEATT" )
+H( "[+] Lunaris ST CHEATT" )
