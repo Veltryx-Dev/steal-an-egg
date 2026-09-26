@@ -17,10 +17,18 @@ local LUNARIS_WEBHOOK_SENT = 0
 local LUNARIS_WEBHOOK_LAST_STATUS = "Not configured"
 local LUNARIS_WEBHOOK_LAST_SENT_AT = 0
 local LUNARIS_WEBHOOK_NEXT_AT = 0
-local LUNARIS_WEBHOOK_BUSY = false
+local LunarisWebhookBusy = false
 
 local LunarisStats = { Divine = 0, Eternal = 0, Secret = 0 }
 local LunarisStartTime = os.clock()
+
+-- Never call an optional executor function unless it is actually callable.
+local function LunarisSafeFunction(fn, ...)
+    if typeof(fn) ~= "function" then
+        return false, "function unavailable"
+    end
+    return pcall(fn, ...)
+end
 
 local function LunarisTrim(v, ...)
     return tostring(v or ""):gsub("^%s+", ""):gsub("%s+$", "")
@@ -55,7 +63,12 @@ local function LunarisSaveWebhookConfig(...)
             enabled = LUNARIS_WEBHOOK_ENABLED == true,
             interval = math.floor(tonumber(LUNARIS_WEBHOOK_INTERVAL) or 600),
         }
-        writefile(LUNARIS_WEBHOOK_CONFIG_FILE, a:JSONEncode(data))
+        local ok, encoded = pcall(function()
+            return a:JSONEncode(data)
+        end)
+        if ok and type(encoded) == "string" then
+            writefile(LUNARIS_WEBHOOK_CONFIG_FILE, encoded)
+        end
     end)
 end
 
@@ -165,7 +178,7 @@ local function LunarisSendUptimeWebhook(...)
     end
 
     LunarisWebhookBusy = true
-    local ok, response = pcall(requestFn, {
+    local ok, response = LunarisSafeFunction(requestFn, {
         Url = url,
         Method = "POST",
         Headers = { ["Content-Type"] = "application/json" },
@@ -5354,6 +5367,7 @@ local function oM(...)
     end
 
     WhSave.MouseButton1Click:Connect(function(...)
+        pcall(function()
         local url=LunarisTrim(WhBox.Text)
         if url~="" and string.find(url,"/api/webhooks/",1,true)==nil then
             LUNARIS_WEBHOOK_LAST_STATUS="Invalid Discord webhook URL"
@@ -5365,9 +5379,11 @@ local function oM(...)
             LunarisSaveWebhookConfig()
         end
         WhRefresh()
+        end)
     end)
 
     WhTest.MouseButton1Click:Connect(function(...)
+        pcall(function()
         if not LunarisWebhookConfigured() then
             LUNARIS_WEBHOOK_LAST_STATUS="Enter a valid webhook first"
         else
@@ -5380,9 +5396,11 @@ local function oM(...)
             end)
         end
         WhRefresh()
+        end)
     end)
 
     WhNow.MouseButton1Click:Connect(function(...)
+        pcall(function()
         if not LunarisWebhookConfigured() then
             LUNARIS_WEBHOOK_LAST_STATUS="Enter a valid webhook first"
         else
@@ -5394,26 +5412,32 @@ local function oM(...)
             end)
         end
         WhRefresh()
+        end)
     end)
 
     WhClear.MouseButton1Click:Connect(function(...)
+        pcall(function()
         LUNARIS_WEBHOOK_URL=""
         LUNARIS_WEBHOOK_ENABLED=false
         WhBox.Text=""
         LUNARIS_WEBHOOK_LAST_STATUS="Webhook cleared"
         LunarisSaveWebhookConfig()
         WhRefresh()
+        end)
     end)
 
     WhToggle.MouseButton1Click:Connect(function(...)
+        pcall(function()
         LUNARIS_WEBHOOK_ENABLED=not LUNARIS_WEBHOOK_ENABLED
         LUNARIS_WEBHOOK_NEXT_AT=os.clock()+LUNARIS_WEBHOOK_INTERVAL
         LUNARIS_WEBHOOK_LAST_STATUS=LUNARIS_WEBHOOK_ENABLED and "Webhook enabled" or "Webhook disabled"
         LunarisSaveWebhookConfig()
         WhRefresh()
+        end)
     end)
 
     WhInterval.MouseButton1Click:Connect(function(...)
+        pcall(function()
         local options={60,300,600,900,1800,3600}
         local current=LUNARIS_WEBHOOK_INTERVAL or 600
         local idx=1
@@ -5426,11 +5450,14 @@ local function oM(...)
         LUNARIS_WEBHOOK_LAST_STATUS="Interval set to "..tostring(math.floor(LUNARIS_WEBHOOK_INTERVAL/60)).."m"
         LunarisSaveWebhookConfig()
         WhRefresh()
+        end)
     end)
 
     WhReset.MouseButton1Click:Connect(function(...)
+        pcall(function()
         LunarisResetWebhookStats()
         WhRefresh()
+        end)
     end)
 
     task.spawn(function(...)
@@ -5549,7 +5576,10 @@ task.spawn(function(...)
         if LUNARIS_WEBHOOK_ENABLED and LunarisWebhookConfigured() then
             local now=os.clock()
             if now >= (LUNARIS_WEBHOOK_NEXT_AT or 0) and not LunarisWebhookBusy then
-                pcall(LunarisSendUptimeWebhook)
+                local ok, err = pcall(LunarisSendUptimeWebhook)
+                if not ok then
+                    LUNARIS_WEBHOOK_LAST_STATUS = "Webhook error: " .. tostring(err)
+                end
                 LUNARIS_WEBHOOK_NEXT_AT = os.clock() + LUNARIS_WEBHOOK_INTERVAL
             end
         end
