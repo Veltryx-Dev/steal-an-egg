@@ -217,16 +217,24 @@ local Window=nil
 local currentLang="EN"
 local executorCheckCaller=typeof(checkcaller)=="function" and checkcaller or function() return false end
 local safeNewCClosure=typeof(newcclosure)=="function" and newcclosure or function(fn) return fn end
-local V=game:GetService( "ProximityPromptService" )pcall(function(...) V.PromptButtonHoldBegan :Connect(function(e,...) pcall(function(...)
-            if typeof(fireproximityprompt)== "function" then
-                fireproximityprompt(e)
-            end
-        end
-        )
+local V=game:GetService( "ProximityPromptService" )
+
+-- Do not globally auto-fire every ProximityPrompt.
+-- The previous global PromptButtonHoldBegan hook could trigger game LocalScripts
+-- re-entrantly and produce repeated "attempt to call a nil value" errors.
+local function LunarisFirePrompt(prompt, holdDuration, ...)
+    if typeof(fireproximityprompt) ~= "function" or not prompt then
+        return false
     end
-    )
+    local ok = pcall(function(...)
+        if holdDuration == nil then
+            fireproximityprompt(prompt)
+        else
+            fireproximityprompt(prompt, holdDuration)
+        end
+    end)
+    return ok
 end
-)
 local H=function(...)
 end
 local t=function(...)
@@ -1342,7 +1350,7 @@ d4=function(e,y,...)
             if r:IsA( "ProximityPrompt" )then
                 pcall(function(...) r.RequiresLineOfSight = false r.HoldDuration = 0
                     if typeof(fireproximityprompt)== "function" then
-                        fireproximityprompt(r, 0 )fireproximityprompt(r)
+                        LunarisFirePrompt(r, 0)
                     end
                 end
                 )
@@ -1358,7 +1366,7 @@ d4=function(e,y,...)
                     if r:IsA( "ProximityPrompt" )then
                         pcall(function(...) r.RequiresLineOfSight = false r.HoldDuration = 0
                             if typeof(fireproximityprompt)== "function" then
-                                fireproximityprompt(r, 0 )fireproximityprompt(r)
+                                LunarisFirePrompt(r, 0)
                             end
                         end
                         )
@@ -2365,7 +2373,7 @@ f4=function(e,...)
             for r,y in ipairs(k:GetDescendants())do
                 if y:IsA( "ProximityPrompt" )and y.Enabled then
                     if typeof(fireproximityprompt)== "function" then
-                        fireproximityprompt(y)
+                        LunarisFirePrompt(y)
                     end
                 end
             end
@@ -2373,7 +2381,7 @@ f4=function(e,...)
                 for r,y in ipairs(k.Parent :GetDescendants())do
                     if y:IsA( "ProximityPrompt" )and y.Enabled then
                         if typeof(fireproximityprompt)== "function" then
-                            fireproximityprompt(y)
+                            LunarisFirePrompt(y)
                         end
                     end
                 end
@@ -2587,7 +2595,7 @@ local function pk(...)
         for r,y in ipairs(r:GetDescendants())do
             if y:IsA( "ProximityPrompt" )and y.Enabled then
                 if typeof(fireproximityprompt)== "function" then
-                    fireproximityprompt(y, 0 )fireproximityprompt(y)
+                    LunarisFirePrompt(y, 0)
                 end
             end
             if y:IsA( "GuiButton" )and y.Visible then
